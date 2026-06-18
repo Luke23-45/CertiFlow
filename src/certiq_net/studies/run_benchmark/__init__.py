@@ -220,7 +220,6 @@ def generate_latex_table(
     metric_key: str = "test_loss",
 ) -> str:
     """Generate a LaTeX table."""
-    # Build display_name -> result lookup
     display_results: OrderedDict[str, dict | None] = OrderedDict()
     for be in BENCHMARK_ENVS:
         display_results[be.display_name] = all_results.get(be.env_name)
@@ -371,7 +370,6 @@ def main() -> None:
     checkpoint: Path | None = Path(args.checkpoint).resolve() if args.checkpoint else None
     checkpoint_dir: Path | None = Path(args.checkpoint_dir).resolve() if args.checkpoint_dir else None
 
-    # Filter environments if --envs was given
     if args.envs is not None:
         env_names = set(args.envs)
         envs = [be for be in BENCHMARK_ENVS if be.env_name in env_names]
@@ -381,9 +379,6 @@ def main() -> None:
     else:
         envs = list(BENCHMARK_ENVS)
 
-    # -------------------------------------------------------------------
-    # Evaluate or load results
-    # -------------------------------------------------------------------
     if not args.table_only:
         if checkpoint is None and checkpoint_dir is None:
             print("Error: specify --checkpoint or --checkpoint-dir (or --table-only)", file=sys.stderr)
@@ -397,7 +392,6 @@ def main() -> None:
         for be in (pbar := tqdm(envs, desc="Benchmarking")):
             pbar.set_description(f"Benchmarking {be.env_name}")
 
-            # Skip if --resume and result already exists
             if args.resume and load_result(be.env_name, results_dir) is not None:
                 tqdm.write(f"  [skip] {be.env_name} (already evaluated)")
                 all_results[be.env_name] = load_result(be.env_name, results_dir)
@@ -435,9 +429,6 @@ def main() -> None:
         for be in envs:
             all_results[be.env_name] = load_result(be.env_name, results_dir)
 
-    # -------------------------------------------------------------------
-    # Generate tables
-    # -------------------------------------------------------------------
     if args.format in ("latex", "both"):
         latex = generate_latex_table(all_results,
                                      caption="CertiQ benchmark results.",
@@ -460,7 +451,3 @@ def main() -> None:
     total = len(envs)
     completed = sum(1 for r in all_results.values() if r is not None)
     print(f"\n{completed}/{total} environments evaluated successfully.", file=sys.stderr)
-
-
-if __name__ == "__main__":
-    main()

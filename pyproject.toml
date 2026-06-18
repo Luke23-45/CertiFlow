@@ -24,6 +24,7 @@ dev = [
 qgym = [
     "pytorch-lightning>=2.5.0,<3.0",
     "torchmetrics>=1.4.0",
+    "stable-baselines3>=2.3.0",
 ]
 
 [tool.setuptools.packages.find]
