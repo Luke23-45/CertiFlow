@@ -10,7 +10,7 @@ import torch.distributions.one_hot_categorical as one_hot_categorical
 import torch.nn as nn
 import torch.nn.functional as F
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.type_aliases import PyTorchObs
+from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from torch import Tensor
 
 
@@ -96,19 +96,14 @@ class CertiQSB3Policy(ActorCriticPolicy):
             return cfg.get("model", cfg)
         return {}
 
-    def _setup_model(self) -> None:
-        self._setup_lr_schedule()
-        self.set_random_seed(self.seed)
-
+    def _build(self, lr_schedule: Schedule) -> None:
         features_dim = self.observation_space.shape[0]
 
-        # Load certiq head params from config if not already provided
         if self._certiq_head_params is None:
             self._certiq_head_params = self._load_certiq_model_config()
 
         from certiq_net.dispatcher.certiq.index_model import MarginalIndexHead
 
-        # Build the core CertiQ model
         self.marginal_index_head = MarginalIndexHead(
             N=self.q,
             hidden_dim=self._certiq_head_params.get("hidden_dim", 128),
@@ -119,31 +114,24 @@ class CertiQSB3Policy(ActorCriticPolicy):
                 "num_inducing_points", 4
             ),
             dropout=self._certiq_head_params.get("dropout", 0.0),
-        ).to(self.device)
-
-        # Effective per-queue service rate
-        self.register_buffer(
-            "_mu_eff",
-            (self.certiq_network.to(self.device) * self.certiq_mu.to(self.device)).sum(
-                dim=0
-            ),
         )
 
-        # SB3-expected attributes (zero-param identity modules)
+        self.register_buffer(
+            "_mu_eff",
+            (self.certiq_network * self.certiq_mu).sum(dim=0),
+        )
+
         self.features_extractor = nn.Identity()
         self.features_dim = features_dim
-
-        # Put encoder in pi_features_extractor so its params go to the policy optimizer
         self.pi_features_extractor = self.marginal_index_head.encoder
         self.vf_features_extractor = nn.Identity()
-
         self.mlp_extractor = _DummyMLPExtractor(features_dim)
-
-        # CertiQ's output heads become SB3's action_net and value_net
         self.action_net = self.marginal_index_head.index_head
         self.value_net = self.marginal_index_head.value_head
 
-        self._initialize_parameters()
+        self.optimizer = self.optimizer_class(
+            self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
+        )
 
     def _expand_pi_to_priority(self, pi: Tensor) -> Tensor:
         """Convert per-queue probs ``(B, Q)`` to per-server priority ``(B, S, Q)``."""
