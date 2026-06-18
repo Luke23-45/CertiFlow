@@ -43,6 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Path to QGym root (default: <project_root>/extern/QGym)")
     parser.add_argument("--output-dir", type=str, default="results",
                         help="Directory to save results JSON (default: results/)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
+    parser.add_argument("--model-config", type=str, default=None,
+                        help="Path to model config YAML (default: configs/model/certiq_index.yaml)")
     return parser
 
 
@@ -166,30 +170,42 @@ def make_draw_fns(env_config: dict, lam_fn):
     return draw_service, draw_inter_arrivals
 
 
-def instantiate_model(env_config: dict, device: str) -> torch.nn.Module:
+def instantiate_model(env_config: dict, device: str, model_config_path: Path | None = None) -> torch.nn.Module:
+    import yaml
+
     from certiq_net.dispatcher.certiq.index_model import CertiQIndexModel
+
+    if model_config_path is not None and model_config_path.exists():
+        with open(model_config_path) as f:
+            cfg = yaml.safe_load(f)
+            if "model" in cfg:
+                cfg = cfg["model"]
+    else:
+        cfg = {}
 
     N = env_config["network"].shape[1]
     model = CertiQIndexModel(
         N=N,
-        hidden_dim=128,
-        tau=1.0,
-        exploration_temperature=1.0,
-        C=20.0,
-        beta=1.0,
-        cost_fn="qmd",
-        encoder_layers=2,
-        num_heads=4,
-        num_inducing_points=4,
-        dropout=0.0,
-        constraint_mode="lagrangian",
+        hidden_dim=cfg.get("hidden_dim", 128),
+        tau=cfg.get("tau", 1.0),
+        exploration_temperature=cfg.get("exploration_temperature", 1.5),
+        C=cfg.get("C", 20.0),
+        beta=cfg.get("beta", 1.0),
+        cost_fn=cfg.get("cost_fn", "qmd"),
+        d_xi=cfg.get("d_xi", 0),
+        encoder_layers=cfg.get("encoder_layers", 2),
+        num_heads=cfg.get("num_heads", 4),
+        num_inducing_points=cfg.get("num_inducing_points", 4),
+        dropout=cfg.get("dropout", 0.0),
+        constraint_mode=cfg.get("constraint_mode", "lagrangian"),
+        cost_learner_hidden_dim=cfg.get("cost_learner_hidden_dim", 64),
     )
     model.eval()
     return model
 
 
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
-    raw = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    raw = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
     if isinstance(raw, dict) and "state_dict" in raw:
         sd = raw["state_dict"]
         cleaned = {
@@ -197,22 +213,28 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
             for k, v in sd.items()
             if k.startswith("model.")
         }
-        model.load_state_dict(cleaned, strict=False)
+        missing, unexpected = model.load_state_dict(cleaned, strict=True)
     elif isinstance(raw, dict):
-        model.load_state_dict(raw, strict=False)
+        missing, unexpected = model.load_state_dict(raw, strict=True)
     else:
-        model.load_state_dict(raw, strict=False)
+        raise TypeError(f"Unexpected checkpoint format: {type(raw)}")
+    if missing:
+        print(f"Warning: missing keys: {missing}", file=sys.stderr)
+    if unexpected:
+        print(f"Warning: unexpected keys: {unexpected}", file=sys.stderr)
     print(f"Loaded checkpoint: {checkpoint_path}", file=sys.stderr)
 
 
 def run_evaluation(args: argparse.Namespace) -> dict:
-    # Lazily resolve project root and QGym submodule
-    certiq_net_root = Path(__file__).resolve().parent.parent.parent.parent
+    import certiq_net
+
+    # Resolve project root from package location
+    project_root = Path(certiq_net.__file__).resolve().parents[2]
 
     if args.qgym_root:
         qgym_root = Path(args.qgym_root).resolve()
     else:
-        qgym_root = certiq_net_root / "extern" / "QGym"
+        qgym_root = project_root / "extern" / "QGym"
 
     if not qgym_root.exists():
         print(f"QGym root not found: {qgym_root}", file=sys.stderr)
@@ -226,6 +248,11 @@ def run_evaluation(args: argparse.Namespace) -> dict:
 
     device = args.device
     env_name = args.env
+    seed = args.seed
+
+    # Set seeds for reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     print(f"Loading env: {env_name}", file=sys.stderr)
     env_config = load_env_config(env_name, qgym_root)
@@ -234,8 +261,14 @@ def run_evaluation(args: argparse.Namespace) -> dict:
         env_config["test_T"] = args.test_steps
         print(f"  test_T: {old_T} -> {args.test_steps}", file=sys.stderr)
 
+    # Resolve model config path
+    if args.model_config:
+        model_config_path = Path(args.model_config).resolve()
+    else:
+        model_config_path = project_root / "configs" / "model" / "certiq_index.yaml"
+
     print(f"Instantiating CertiQ model for N={env_config['network'].shape[1]}", file=sys.stderr)
-    model = instantiate_model(env_config, device)
+    model = instantiate_model(env_config, device, model_config_path=model_config_path)
 
     print(f"Loading checkpoint: {args.checkpoint}", file=sys.stderr)
     load_checkpoint(model, args.checkpoint)
@@ -245,6 +278,7 @@ def run_evaluation(args: argparse.Namespace) -> dict:
     lam_fn = make_lam_fn(env_config)
     draw_service, draw_inter_arrivals = make_draw_fns(env_config, lam_fn)
     model_config = build_model_config(device, args.test_batch)
+    model_config["env"]["test_seed"] = seed
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

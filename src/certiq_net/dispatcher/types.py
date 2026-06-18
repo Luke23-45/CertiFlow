@@ -25,6 +25,9 @@ class DispatcherDiagnostics:
     pressure_mean: Tensor
     pressure_max: Tensor
     pressure_update_norm: Tensor
+    A_cert: Tensor | None = None
+    solver_status: Tensor | None = None
+    nu: Tensor | None = None
 
 
 @dataclass(frozen=True)

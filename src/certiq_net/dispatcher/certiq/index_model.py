@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from certiq_net.dispatcher.certiq.certificate import (
+    DifferentiableKLProjection,
+)
 from certiq_net.dispatcher.certiq.cost_learner import CostLearner
 from certiq_net.dispatcher.certiq.interaction import (
     DispatchInteractionEncoder,
@@ -167,45 +170,66 @@ class CertiQIndexModel(nn.Module):
         proposal_logits = proposal_logits.clamp(min=-20, max=20)
 
         if self.constraint_mode == "projection":
-            raise NotImplementedError(
-                "Projection mode requires the full KL-projection diagnostics "
-                "fields (A_cert, solver_status, etc.) which have been removed "
-                "from DispatcherDiagnostics. Use constraint_mode='lagrangian' "
-                "for the soft-constrained path."
+            p_cert, nu, solver_status = DifferentiableKLProjection.apply(
+                proposal_logits, cost, budget
             )
-        # Lagrangian and unconstrained modes both use plain softmax;
-        # the difference is only in the training loss.
-        pi = torch.softmax(proposal_logits, dim=-1)
+            pi = p_cert
+            a_cert = (pi * cost).sum(dim=-1)
+            slack = budget - a_cert
+        else:
+            # Lagrangian and unconstrained modes both use plain softmax;
+            # the difference is only in the training loss.
+            pi = torch.softmax(proposal_logits, dim=-1)
+            p_cert = None
+            nu = None
+            solver_status = None
+            a_cert = None
+            slack = None
         # Final safety net: replace any NaN/Inf with small uniform noise
         if torch.isnan(pi).any() or torch.isinf(pi).any():
             pi = torch.nan_to_num(pi, nan=1e-8, posinf=1e-8, neginf=1e-8)
             pi = pi / pi.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-        # Diagnostics (dual variable belongs to the training module)
-        a_final = (pi * cost).sum(dim=-1)
-        constraint_violation = (a_final - budget).clamp(min=0.0)
+        # Diagnostics depend on constraint mode
+        if self.constraint_mode == "projection":
+            a_proposal = (torch.softmax(proposal_logits, dim=-1) * cost).sum(dim=-1)
+            a_final = a_cert
+            constraint_violation_val = torch.zeros_like(budget)
+            slack_val = slack
+            p_cert_out = p_cert
+        else:
+            a_proposal = (pi * cost).sum(dim=-1)
+            a_final = a_proposal
+            constraint_violation_val = (a_final - budget).clamp(min=0.0)
+            slack_val = budget - a_final
+            p_cert_out = pi
+
+        ent = -(pi * pi.clamp_min(1e-9).log()).sum(dim=-1)
 
         diag = DispatcherDiagnostics(
-            A_proposal=a_final,
+            A_proposal=a_proposal,
             A_final=a_final,
             m_Q=cost_min,
             B_Q=budget,
-            certificate_slack=budget - a_final,
-            constraint_violation=constraint_violation,
+            certificate_slack=slack_val,
+            constraint_violation=constraint_violation_val,
             usage_raw=torch.ones(batch, device=Q.device, dtype=Q.dtype),
             usage_final=torch.ones(batch, device=Q.device, dtype=Q.dtype),
             usage_cap=torch.ones(batch, device=Q.device, dtype=Q.dtype),
-            policy_entropy=-(pi * pi.clamp_min(1e-9).log()).sum(dim=-1),
+            policy_entropy=ent,
             selected_resource=pi.argmax(dim=-1),
             pressure_mean=torch.zeros(batch, device=Q.device, dtype=Q.dtype),
             pressure_max=torch.zeros(batch, device=Q.device, dtype=Q.dtype),
             pressure_update_norm=torch.zeros(batch, device=Q.device, dtype=Q.dtype),
+            A_cert=a_cert,
+            solver_status=solver_status,
+            nu=nu,
         )
         return DispatcherForward(
             pi=pi,
             diagnostics=diag,
             value=value,
-            p_cert=pi,
+            p_cert=p_cert_out,
             p_proposal=pi,
             usage_raw=diag.usage_raw,
             usage_final=diag.usage_final,
