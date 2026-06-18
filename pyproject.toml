@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "certiq-net"
+version = "0.2.0"
+description = "CertiQ-Net — learned certified dispatch for queueing systems"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "torch>=2.4.0,<3.0",
+    "numpy>=1.26.0",
+    "scipy>=1.13.0",
+    "tqdm>=4.66.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "ruff>=0.5.0",
+]
+qgym = [
+    "pytorch-lightning>=2.5.0,<3.0",
+    "torchmetrics>=1.4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = ["extern"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short"

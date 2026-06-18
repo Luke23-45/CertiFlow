@@ -1,0 +1,17 @@
+# CertiQIndexModel architecture used during training
+model:
+  _target_: certiq_net.dispatcher.certiq.index_model.CertiQIndexModel
+  N: 8
+  hidden_dim: 128
+  tau: 1.0
+  exploration_temperature: 1.5
+  C: 20.0
+  beta: 1.0
+  cost_fn: qmd
+  d_xi: 0
+  encoder_layers: 2
+  num_heads: 4
+  num_inducing_points: 4
+  dropout: 0.0
+  constraint_mode: lagrangian
+  cost_learner_hidden_dim: 64

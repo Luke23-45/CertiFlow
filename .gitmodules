@@ -1,0 +1,3 @@
+[submodule "extern/QGym"]
+	path = extern/QGym
+	url = https://github.com/namkoong-lab/QGym
