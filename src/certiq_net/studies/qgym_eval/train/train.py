@@ -96,6 +96,7 @@ def main() -> None:
 
     # ── Training hyperparams ───────────────────────────────────────────────
     device = policy_cfg["env"]["device"]
+    env_device = "cpu" if device == "cuda" else device
     test_seed = policy_cfg["env"]["test_seed"]
     train_seed = policy_cfg["env"]["train_seed"]
     env_temp = policy_cfg["env"]["env_temp"]
@@ -118,7 +119,7 @@ def main() -> None:
             batch=1,
             seed=train_seed,
             policy_name=policy_name,
-            device=torch.device(device),
+            device=torch.device(env_device),
         )
 
     def make_test_env(seed):
@@ -128,7 +129,7 @@ def main() -> None:
             batch=1,
             seed=seed,
             policy_name=policy_name,
-            device=torch.device(device),
+            device=torch.device(env_device),
         )
 
     dq_raw = load_rl_p_env(
@@ -137,7 +138,7 @@ def main() -> None:
         batch=1,
         seed=train_seed,
         policy_name=policy_name,
-        device=torch.device(device),
+        device=torch.device(env_device),
     )
 
     env_fns = [make_env for _ in range(actors)]
