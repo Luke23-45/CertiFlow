@@ -5,13 +5,28 @@ Usage
     python -m certiq_net.studies.qgym_eval.train.train ^
         vanilla ^
         reentrant_2
+    python -m certiq_net.studies.qgym_eval.train.train ^
+        vanilla ^
+        reentrant_2 ^
+        --parallel --num-actors 8
 
 The first positional arg is the policy-config stem (``vanilla.yaml`` in
 ``extern/QGym/RL/policy_configs/``). The second is the env-config stem
 (``reentrant_2.yaml`` in ``extern/QGym/configs/env/``).
 
-Add ``--use-lagrangian`` to enable the CertiQ certificate constraint
-in the PPO loss.
+Flags
+-----
+``--device cpu``
+    Force CPU training (recommended for MLP policy without CNN).
+``--parallel``
+    Use ``SubprocVecEnv`` for parallel environment stepping.
+``--num-actors N``
+    Override number of parallel envs (default: from config; keep <=~8 on
+    Windows to avoid page-file limits from spawn subprocesses).
+``--compile``
+    Apply ``torch.compile`` to the policy forward pass (experimental).
+``--use-lagrangian``
+    Enable the CertiQ certificate constraint in the PPO loss.
 """
 
 from __future__ import annotations
@@ -26,11 +41,13 @@ import yaml
 from torch import nn
 
 import certiq_net
+from certiq_net.studies.qgym_eval.patches.apply_patches import ensure_patches_applied
 from certiq_net.studies.qgym_eval.train.certiq_sb3_policy import CertiQSB3Policy
+from stable_baselines3.common.env_util import DummyVecEnv, SubprocVecEnv
+
 from certiq_net.studies.qgym_eval.train.qgym_import import (
     CustomPPOTrainer,
     CustomRolloutBuffer,
-    DummyVecEnv,
     load_rl_p_env,
     parallel_eval,
 )
@@ -46,6 +63,9 @@ def _load_yaml(path: Path) -> dict:
 
 
 def main() -> None:
+    # Apply QGym submodule patches (tensor fixes, etc.) before any QGym imports
+    ensure_patches_applied()
+
     parser = argparse.ArgumentParser(
         description="Train CertiQ using QGym's PPO pipeline"
     )
@@ -61,6 +81,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--device", type=str, default=None, help="Override device (e.g. 'cuda', 'cpu')"
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Apply torch.compile to policy forward pass (experimental)",
+    )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="Use SubprocVecEnv for parallel env stepping (requires --num-actors <= ~8 on Windows)",
+    )
+    parser.add_argument(
+        "--num-actors", type=int, default=None,
+        help="Override the number of actor envs (default: from policy config)",
     )
     args = parser.parse_args()
 
@@ -104,7 +138,7 @@ def main() -> None:
     time_f = policy_cfg["env"].get("time_f", False)
     policy_name = policy_cfg["model"]["policy_name"]
 
-    actors = policy_cfg["training"]["actors"]
+    actors = args.num_actors if args.num_actors is not None else policy_cfg["training"]["actors"]
     num_epochs = policy_cfg["training"]["num_epochs"]
     episode_steps = policy_cfg["training"]["episode_steps"]
     total_steps = num_epochs * episode_steps * actors
@@ -112,12 +146,12 @@ def main() -> None:
     test_T = env_cfg.get("test_T", 10000)
 
     # ── Create environments ────────────────────────────────────────────────
-    def make_env():
+    def make_env(seed):
         return load_rl_p_env(
             env_config=env_cfg,
             temp=env_temp,
             batch=1,
-            seed=train_seed,
+            seed=seed,
             policy_name=policy_name,
             device=torch.device(env_device),
         )
@@ -141,9 +175,11 @@ def main() -> None:
         device=torch.device(env_device),
     )
 
-    env_fns = [make_env for _ in range(actors)]
-    raw_envs = [make_test_env(seed) for seed in range(train_seed, train_seed + actors)]
-    dq = DummyVecEnv(env_fns)
+    env_fns = [lambda s=seed: make_env(s) for seed in range(train_seed, train_seed + actors)]
+    if args.parallel:
+        dq = SubprocVecEnv(env_fns, start_method="spawn")
+    else:
+        dq = DummyVecEnv(env_fns)
 
     dq_test_list = [make_test_env(seed) for seed in range(test_seed, test_seed + 100)]
 
@@ -178,15 +214,7 @@ def main() -> None:
         per_iter_normal_value=policy_cfg["training"]["per_iter_normal_value"],
     )
 
-    trainer_cls = CustomPPOTrainer
-    if args.use_lagrangian:
-        from certiq_net.studies.qgym_eval.train.certiq_ppo_trainer import CertiqPPOTrainer
-
-        trainer_cls = CertiqPPOTrainer
-
-    model = trainer_cls(
-        CertiQSB3Policy,
-        dq,
+    trainer_kwargs = dict(
         learning_rate=policy_cfg["training"]["lr"],
         lr_policy=policy_cfg["training"]["lr_policy"],
         lr_value=policy_cfg["training"]["lr_value"],
@@ -202,7 +230,6 @@ def main() -> None:
         clip_range=0.2,
         clip_range_vf=policy_cfg["training"]["clip_range_vf"],
         normalize_advantage=policy_cfg["training"]["normalize_advantage"],
-        raw_env=raw_envs,
         normalize_value=policy_cfg["training"]["normalize_value"],
         rescale_v=policy_cfg["training"]["rescale_v"],
         ent_coef=policy_cfg["training"]["ent_coef"],
@@ -221,8 +248,23 @@ def main() -> None:
         seed=None,
         device=device,
         _init_setup_model=True,
-        lr_nu=args.lr_nu,
     )
+
+    trainer_cls = CustomPPOTrainer
+    if args.use_lagrangian:
+        from certiq_net.studies.qgym_eval.train.certiq_ppo_trainer import CertiqPPOTrainer
+
+        trainer_cls = CertiqPPOTrainer
+        trainer_kwargs["lr_nu"] = args.lr_nu
+
+    model = trainer_cls(CertiQSB3Policy, dq, **trainer_kwargs)
+
+    # ── Optional: compile policy for faster forward pass ──────────────────
+    if args.compile:
+        print("[train] Applying torch.compile to policy (mode=reduce-overhead) …")
+        model.policy._run_certiq = torch.compile(
+            model.policy._run_certiq, mode="reduce-overhead"
+        )
 
     # ── Evaluation callback ────────────────────────────────────────────────
     test_policy = policy_cfg["policy"]["test_policy"]

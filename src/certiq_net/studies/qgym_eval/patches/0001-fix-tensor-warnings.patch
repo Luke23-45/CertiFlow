@@ -1,0 +1,51 @@
+diff --git a/RL/utils/rl_env.py b/RL/utils/rl_env.py
+index ce83bbc..4ea6f01 100644
+--- a/RL/utils/rl_env.py
++++ b/RL/utils/rl_env.py
+@@ -126,13 +126,13 @@ def load_rl_p_env(env_config, temp, batch, seed, policy_name, device):
+         network_path = os.path.join(project_root, 'configs', 'env_data', env_type, f'{env_type}_network.npy')
+         env_config['network'] = np.load(network_path)
+ 
+-    env_config['network'] = torch.tensor(env_config['network']).float()
++    env_config['network'] = torch.as_tensor(env_config['network'], dtype=torch.float32)
+ 
+ 
+     if env_config['mu'] is None:
+         mu_path = os.path.join(project_root, 'configs', 'env_data', env_type, f'{env_type}_mu.npy')
+         env_config['mu'] = np.load(mu_path)
+-    env_config['mu'] = torch.tensor(env_config['mu']).float()
++    env_config['mu'] = torch.as_tensor(env_config['mu'], dtype=torch.float32)
+ 
+     orig_s, orig_q = env_config['network'].size()
+ 
+@@ -156,7 +156,7 @@ def load_rl_p_env(env_config, temp, batch, seed, policy_name, device):
+ 
+     lam_type = env_config['lam_type']
+     lam_params = env_config['lam_params']
+-    h = torch.tensor(env_config['h'])
++    h = torch.as_tensor(env_config['h'])
+ 
+     if lam_params['val'] is None:
+         lam_r_path = os.path.join(project_root, 'configs', 'env_data', env_type, f'{env_type}_lam.npy')
+diff --git a/main/env.py b/main/env.py
+index 5420437..393f4d6 100644
+--- a/main/env.py
++++ b/main/env.py
+@@ -92,7 +92,7 @@ class DiffDiscreteEventSystem(gym.Env):
+         self.mu = mu.repeat(batch,1,1).to(self.device)
+         self.q = self.network.size()[-1]
+         self.s = self.network.size()[-2]
+-        self.h = torch.tensor(h).float().to(device)
++        self.h = torch.as_tensor(h, dtype=torch.float32, device=device)
+         self.temp = temp
+         self.st_argmin = STargmin(temp = self.temp)
+         self.f_hook = f_hook
+@@ -172,7 +172,7 @@ class DiffDiscreteEventSystem(gym.Env):
+         # print(queues)    
+         ###TODO Changed
+         if self.use_sb:
+-            action = torch.tensor(action).float().to(self.device)
++            action = torch.as_tensor(action, dtype=torch.float32, device=self.device)
+             
+         action = action * self.network
+         
