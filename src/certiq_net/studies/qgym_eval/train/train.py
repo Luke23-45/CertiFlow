@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -177,7 +178,8 @@ def main() -> None:
 
     env_fns = [lambda s=seed: make_env(s) for seed in range(train_seed, train_seed + actors)]
     if args.parallel:
-        dq = SubprocVecEnv(env_fns, start_method="spawn")
+        start_method = "spawn" if sys.platform == "win32" else "fork"
+        dq = SubprocVecEnv(env_fns, start_method=start_method)
     else:
         dq = DummyVecEnv(env_fns)
 
