@@ -217,6 +217,8 @@ class CertiQSB3Policy(ActorCriticPolicy):
         deterministic: bool = False,
     ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
         self.set_training_mode(False)
+        if isinstance(observation, torch.Tensor):
+            observation = observation.cpu().numpy()
         obs_tensor, vectorized_env = self.obs_to_tensor(observation)
         obs_tensor = obs_tensor.view(-1, self.q)
         with torch.no_grad():
