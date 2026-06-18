@@ -75,10 +75,92 @@ class _Timer:
 
 # ── Component runners ────────────────────────────────────────────────────────
 
-def _run_env_step(env, action, reps: int) -> None:
-    """Single env.step() — the QGym kernel."""
-    for _ in range(reps):
-        env.step(action)
+# NOTE on methodology:
+# `DiffDiscreteEventSystem.step` cost grows with queue depth — it contains
+# `for q in range(self.q)` loops (extern/QGym/main/env.py) and the `service_times`
+# lists are Python lists that grow/shrink as jobs arrive and depart. A step from
+# a congested state is therefore much more expensive than a step from a clean
+# state. To get a steady-state per-step number we MUST reset the env before each
+# timed step, and we must keep `env.reset()` OUTSIDE the timed window (it rebuilds
+# the whole env state). The generic `_Timer` times the whole fn body, so it cannot
+# exclude reset; we use the dedicated `_time_env` helper below instead.
+#
+# Additionally, the action matters: `allocator()` in env.py allocates servers via
+# `int(torch.round(action))`. An action whose entries are < 0.5 rounds to 0, so no
+# server is ever allocated and no job is ever served — queues only grow. A
+# servicing action (entries >= 1.0 on at least one server per queue) lets the
+# simulator drain, giving a realistic operating regime.
+
+
+def _time_env(
+    name: str,
+    mode: str,
+    env,
+    action,
+    *,
+    reps: int,
+    horizon: int = 1,
+    warmup: int = 20,
+) -> float:
+    """Time env.step() with reset correctly excluded from the timed window.
+
+    modes:
+      - "steady":   reset before EACH step; time only the step. → ms/step from a
+                    clean state. Apples-to-apples vs policy.forward / train step.
+      - "horizon":  reset once, then step `horizon` times; repeat `reps` episodes.
+                    → ms/step amortized over a full episode (realistic for training,
+                      where one rollout = many consecutive steps, no reset).
+      - "congested": reset once, then step `reps` times with no reset and (caller
+                     should pass) a non-servicing action. Reproduces the old flawed
+                     measurement so the inflation is visible.
+
+    Reset is always performed outside the perf_counter span.
+    """
+    print(f"  [{name}] mode={mode} warmup {warmup}x ...", end=" ", flush=True)
+
+    if mode == "steady":
+        for _ in range(warmup):
+            env.reset()
+            env.step(action)
+        print(f"timing {reps}x (reset excluded) ...", end=" ", flush=True)
+        t0 = _time.perf_counter()
+        for _ in range(reps):
+            env.reset()
+            env.step(action)
+        elapsed = _time.perf_counter() - t0
+        ms_per = elapsed * 1000 / reps
+
+    elif mode == "horizon":
+        for _ in range(warmup):
+            env.reset()
+            for _ in range(horizon):
+                env.step(action)
+        print(f"timing {reps}x {horizon}-step episodes (reset excluded) ...",
+              end=" ", flush=True)
+        t0 = _time.perf_counter()
+        for _ in range(reps):
+            env.reset()
+            for _ in range(horizon):
+                env.step(action)
+        elapsed = _time.perf_counter() - t0
+        ms_per = elapsed * 1000 / (reps * horizon)
+
+    elif mode == "congested":
+        for _ in range(warmup):
+            env.step(action)
+        print(f"timing {reps}x (NO reset, congested) ...", end=" ", flush=True)
+        env.reset()
+        t0 = _time.perf_counter()
+        for _ in range(reps):
+            env.step(action)
+        elapsed = _time.perf_counter() - t0
+        ms_per = elapsed * 1000 / reps
+
+    else:
+        raise ValueError(f"unknown mode {mode!r}")
+
+    print(f" done.  avg {ms_per:.3f} ms/step")
+    return ms_per
 
 
 def _run_policy_forward(policy, obs_tensor) -> None:
@@ -237,9 +319,19 @@ def main() -> None:
     batch_obs = single_obs.unsqueeze(0).expand(batch_size, -1).contiguous()   # (B, q)
     actors_obs = single_obs.unsqueeze(0).expand(actors, -1).contiguous()      # (A, q)
 
-    # Use a uniform priority action for env stepping — random untrained policy
-    # actions can cause the QGym event simulation to enter an infinite loop.
-    safe_action = np.ones((orig_s, orig_q), dtype=np.float32) / orig_q
+    # Servicing action: allocator() in env.py allocates servers via
+    # int(torch.round(action)), so action entries must be >= 1.0 for at least one
+    # server per queue to actually allocate a server and serve jobs. Allocate
+    # server 0 fully to every queue → round(1.0)=1 server per non-empty queue,
+    # so queues drain and the sim reaches a realistic operating regime.
+    servicing_action = np.zeros((orig_s, orig_q), dtype=np.float32)
+    servicing_action[0, :] = 1.0
+
+    # Non-servicing (baseline) action: the OLD `safe_action`. Every entry < 0.5
+    # rounds to 0, so no server is ever allocated, no job is ever served, and
+    # queues grow monotonically. Kept only to demonstrate the congestion
+    # pathology that inflated the previous 410 ms/step number.
+    congested_action = np.ones((orig_s, orig_q), dtype=np.float32) / orig_q
 
     # Policy action for training-component tests (needs valid graph)
     action = policy(single_obs.unsqueeze(0))[0][0].detach()  # (S, Q)
@@ -254,12 +346,33 @@ def main() -> None:
     timer = _Timer
 
     # ── 1. Environment stepping ─────────────────────────────────────────────
+    # Steady-state: reset before each step, reset excluded from timing.
+    # This is the trustworthy per-step number (vs the old 410 ms which measured
+    # steps from an ever-more-congested state with an action that never served).
     print("\n--- QGym Environment ---")
-    # Use uniform-safe action (untrained policy actions can hang the simulation)
-    env_step_reps = 200
-    t_env_single = timer("env.step (1 env, 1 step)", reps=env_step_reps, warmup=20, sync=False)(
-        _run_env_step, dq, safe_action, env_step_reps
+    t_env_single = _time_env(
+        "env.step (steady-state)", mode="steady",
+        env=dq, action=servicing_action, reps=200, warmup=20,
     )
+    # Amortized over a full episode (no reset between steps) — realistic for
+    # training, where one rollout = many consecutive steps.
+    horizon = min(episode_steps, 1000)
+    t_env_horizon = _time_env(
+        "env.step (full episode)", mode="horizon",
+        env=dq, action=servicing_action, reps=20, horizon=horizon, warmup=2,
+    )
+    # Diagnostic: reproduce the old flawed measurement (non-servicing action, no
+    # reset). Expect this to be MUCH higher than steady-state, proving the
+    # inflation. Low reps because each rep mutates state and gets progressively
+    # slower.
+    t_env_congested = _time_env(
+        "env.step (congested — old method)", mode="congested",
+        env=dq, action=congested_action, reps=200, warmup=0,
+    )
+    if t_env_congested > 0:
+        print(f"  >> steady-state is {t_env_congested / t_env_single:.1f}x "
+              f"faster than the old congested measurement "
+              f"({t_env_single:.3f} vs {t_env_congested:.3f} ms/step)")
 
     # ── 2. Policy forward (single) ──────────────────────────────────────────
     print("\n--- CertiQ Policy Forward ---")
@@ -312,8 +425,11 @@ def main() -> None:
     b = batch_size
 
     # Collect phase
+    # Use the amortized-over-episode per-step cost (t_env_horizon), since a
+    # rollout is many consecutive steps with no reset. t_env_single (steady-state)
+    # is a lower bound; the truth is between them.
     fwd_per_timestep = t_forward_actors  # ms for 1 policy forward over `actors` obs
-    step_per_timestep = t_env_single * actors  # ms for stepping all `actors` envs
+    step_per_timestep = t_env_horizon * actors  # ms for stepping all `actors` envs
     collect_per_timestep = fwd_per_timestep + step_per_timestep
     collect_total = collect_per_timestep * episode_steps / 1000  # seconds
 
