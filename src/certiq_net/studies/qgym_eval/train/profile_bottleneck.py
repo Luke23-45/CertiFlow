@@ -110,9 +110,12 @@ def _time_env(
       - "horizon":  reset once, then step `horizon` times; repeat `reps` episodes.
                     → ms/step amortized over a full episode (realistic for training,
                       where one rollout = many consecutive steps, no reset).
-      - "congested": reset once, then step `reps` times with no reset and (caller
-                     should pass) a non-servicing action. Reproduces the old flawed
-                     measurement so the inflation is visible.
+      - "old_buggy": faithful reproduction of the PRE-FIX measurement. The old
+                     code called _run_env_step(reps=N) from inside _Timer(reps=N),
+                     so it timed N*N steps and divided by N — reporting "per-N-
+                     steps" while labeling it "per-1-step" (a N× mislabel). With
+                     N=200 that is the source of the old "~410 ms/step" number.
+                     We print both the bogus old-label and the true per-step.
 
     Reset is always performed outside the perf_counter span.
     """
@@ -145,16 +148,28 @@ def _time_env(
         elapsed = _time.perf_counter() - t0
         ms_per = elapsed * 1000 / (reps * horizon)
 
-    elif mode == "congested":
+    elif mode == "old_buggy":
+        # Faithful reproduction of the pre-fix measurement: the old code wrapped
+        # _run_env_step(reps=N) inside _Timer(reps=N), so it timed N*N steps but
+        # divided total by N → reported "per-N-steps" while labeling it per-step.
+        # We expose the mislabel explicitly: return the bogus old-label value so
+        # it can be compared to the true steady-state number.
+        n_inner = horizon  # reuse horizon kwarg as the old reps-per-call (N)
         for _ in range(warmup):
             env.step(action)
-        print(f"timing {reps}x (NO reset, congested) ...", end=" ", flush=True)
+        print(f"timing {reps}x outer x {n_inner}x inner "
+              f"(={reps*n_inner} steps, ÷{reps} = old mislabel) ...",
+              end=" ", flush=True)
         env.reset()
         t0 = _time.perf_counter()
         for _ in range(reps):
-            env.step(action)
+            for _ in range(n_inner):
+                env.step(action)
         elapsed = _time.perf_counter() - t0
-        ms_per = elapsed * 1000 / reps
+        ms_per = elapsed * 1000 / reps  # the BOGUS old per-(N-steps) label
+        true_per_step = elapsed * 1000 / (reps * n_inner)
+        print(f" done.  old label={ms_per:.3f} ms | true={true_per_step:.3f} ms/step")
+        return ms_per
 
     else:
         raise ValueError(f"unknown mode {mode!r}")
@@ -327,10 +342,11 @@ def main() -> None:
     servicing_action = np.zeros((orig_s, orig_q), dtype=np.float32)
     servicing_action[0, :] = 1.0
 
-    # Non-servicing (baseline) action: the OLD `safe_action`. Every entry < 0.5
-    # rounds to 0, so no server is ever allocated, no job is ever served, and
-    # queues grow monotonically. Kept only to demonstrate the congestion
-    # pathology that inflated the previous 410 ms/step number.
+    # Non-servicing action: every entry < 0.5 rounds to 0 in allocator(), so no
+    # server is allocated and the per-queue allocation branches in step() are
+    # skipped. NOTE: this is NOT what inflated the old 410 ms number (that was a
+    # double-loop timing bug — see old_buggy mode below). Kept only because the
+    # old code used it; it makes step() slightly cheaper, not pricier.
     congested_action = np.ones((orig_s, orig_q), dtype=np.float32) / orig_q
 
     # Policy action for training-component tests (needs valid graph)
@@ -346,9 +362,8 @@ def main() -> None:
     timer = _Timer
 
     # ── 1. Environment stepping ─────────────────────────────────────────────
-    # Steady-state: reset before each step, reset excluded from timing.
-    # This is the trustworthy per-step number (vs the old 410 ms which measured
-    # steps from an ever-more-congested state with an action that never served).
+    # Steady-state: reset before each step, reset excluded from timing. This is
+    # the trustworthy per-step number from a clean state.
     print("\n--- QGym Environment ---")
     t_env_single = _time_env(
         "env.step (steady-state)", mode="steady",
@@ -361,18 +376,20 @@ def main() -> None:
         "env.step (full episode)", mode="horizon",
         env=dq, action=servicing_action, reps=20, horizon=horizon, warmup=2,
     )
-    # Diagnostic: reproduce the old flawed measurement (non-servicing action, no
-    # reset). Expect this to be MUCH higher than steady-state, proving the
-    # inflation. Low reps because each rep mutates state and gets progressively
-    # slower.
-    t_env_congested = _time_env(
-        "env.step (congested — old method)", mode="congested",
-        env=dq, action=congested_action, reps=200, warmup=0,
+    # Diagnostic: faithfully reproduce the PRE-FIX (buggy) measurement. The old
+    # code wrapped _run_env_step(reps=N) inside _Timer(reps=N), so it timed N*N
+    # steps and divided by N — reporting "per-N-steps" while labeling it per-step.
+    # With N=200 this is the source of the old "~410 ms/step" figure. We pass the
+    # non-servicing action because that's what the old code used; the action itself
+    # is NOT the cause (it just skips the allocation branches), the double-loop is.
+    t_env_old_label = _time_env(
+        "env.step (old buggy method)", mode="old_buggy",
+        env=dq, action=congested_action, reps=1, horizon=200, warmup=0,
     )
-    if t_env_congested > 0:
-        print(f"  >> steady-state is {t_env_congested / t_env_single:.1f}x "
-              f"faster than the old congested measurement "
-              f"({t_env_single:.3f} vs {t_env_congested:.3f} ms/step)")
+    print(f"  >> the old '410 ms/step' figure was a {200}x mislabel "
+          f"(timed {200*200} steps, divided by 200). "
+          f"True per-step ≈ {t_env_old_label/200:.3f} ms — consistent with the "
+          f"steady-state {t_env_single:.3f} ms measurement above.")
 
     # ── 2. Policy forward (single) ──────────────────────────────────────────
     print("\n--- CertiQ Policy Forward ---")
