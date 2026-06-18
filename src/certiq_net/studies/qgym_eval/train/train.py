@@ -25,6 +25,8 @@ Flags
     Windows to avoid page-file limits from spawn subprocesses).
 ``--compile``
     Apply ``torch.compile`` to the policy forward pass (experimental).
+``--profile``
+    Print per-iteration timing breakdown (env.step vs collect vs train).
 ``--use-lagrangian``
     Enable the CertiQ certificate constraint in the PPO loss.
 """
@@ -34,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time as _time
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +55,91 @@ from certiq_net.studies.qgym_eval.train.qgym_import import (
     load_rl_p_env,
     parallel_eval,
 )
+
+
+# ── Profiling helpers ────────────────────────────────────────────────────────
+
+class _IterProfiler:
+    """Records wall-clock ms per named section, resetting each iteration."""
+
+    def __init__(self):
+        self._slots: dict[str, float] = {}
+        self._counts: dict[str, int] = {}
+
+    def clear(self):
+        self._slots.clear()
+        self._counts.clear()
+
+    def add(self, name: str, ms: float):
+        self._slots[name] = self._slots.get(name, 0.0) + ms
+        self._counts[name] = self._counts.get(name, 0) + 1
+
+    def __getitem__(self, name: str) -> float:
+        return self._slots.get(name, 0.0)
+
+    def report(self) -> str:
+        total = sum(self._slots.values())
+        lines = ["\n=== Per-iteration profile ==="]
+        for name, ms in sorted(self._slots.items(), key=lambda x: -x[1]):
+            cnt = self._counts.get(name, 1)
+            pct = ms / total * 100 if total > 0 else 0.0
+            lines.append(f"  {name:32s}  {ms:>8.1f}ms  ({cnt}x  avg {ms/cnt:>5.1f}ms  {pct:>3.0f}%)")
+        lines.append(f"  {'TOTAL':32s}  {total:>8.1f}ms")
+        return "\n".join(lines)
+
+
+def _install_profiler(model, device: str) -> None:
+    """Monkey-patch model.env.step / model.collect_rollouts / model.train with
+    wall-clock timing, printing a breakdown after each ``train()`` call.
+
+    Instance-attribute replacement (no ``__get__``) — Python does *not*
+    prepend ``self`` when calling a plain function stored on an instance.
+    """
+    p = _IterProfiler()
+    sync = torch.cuda.synchronize if "cuda" in device else lambda: None
+    now = _time.perf_counter
+
+    # --- Wrap env.step ---
+    _orig_step = model.env.step
+
+    def _timed_step(*args, **kwargs):
+        t0 = now()
+        try:
+            return _orig_step(*args, **kwargs)
+        finally:
+            p.add("env.step", (now() - t0) * 1000)
+
+    model.env.step = _timed_step
+
+    # --- Wrap collect_rollouts ---
+    _orig_collect = model.collect_rollouts
+
+    def _timed_collect(*args, **kwargs):
+        p.clear()
+        sync()
+        t0 = now()
+        try:
+            return _orig_collect(*args, **kwargs)
+        finally:
+            sync()
+            p.add("collect_rollouts", (now() - t0) * 1000)
+
+    model.collect_rollouts = _timed_collect
+
+    # --- Wrap train ---
+    _orig_train = model.train
+
+    def _timed_train():
+        sync()
+        t0 = now()
+        try:
+            return _orig_train()
+        finally:
+            sync()
+            p.add("model.train", (now() - t0) * 1000)
+            print(p.report())
+
+    model.train = _timed_train
 
 _project_root = Path(certiq_net.__file__).resolve().parents[2]
 _QGYM_ROOT = _project_root / "extern" / "QGym"
@@ -96,6 +184,11 @@ def main() -> None:
     parser.add_argument(
         "--num-actors", type=int, default=None,
         help="Override the number of actor envs (default: from policy config)",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Print per-iteration timing breakdown (env.step vs collect vs train)",
     )
     args = parser.parse_args()
 
@@ -260,6 +353,10 @@ def main() -> None:
         trainer_kwargs["lr_nu"] = args.lr_nu
 
     model = trainer_cls(CertiQSB3Policy, dq, **trainer_kwargs)
+
+    # ── Optional: install per-iteration profiler ─────────────────────────
+    if args.profile:
+        _install_profiler(model, device)
 
     # ── Optional: compile policy for faster forward pass ──────────────────
     if args.compile:
