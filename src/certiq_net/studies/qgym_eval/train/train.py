@@ -59,10 +59,15 @@ def main() -> None:
     parser.add_argument(
         "--lr-nu", type=float, default=1e-3, help="Learning rate for the Lagrangian dual variable"
     )
+    parser.add_argument(
+        "--device", type=str, default=None, help="Override device (e.g. 'cuda', 'cpu')"
+    )
     args = parser.parse_args()
 
     # ── Load configs ────────────────────────────────────────────────────────
     policy_cfg = _load_yaml(_RL_ROOT / "policy_configs" / f"{args.policy_config}.yaml")
+    if args.device is not None:
+        policy_cfg["env"]["device"] = args.device
     env_cfg = _load_yaml(_QGYM_ROOT / "configs" / "env" / f"{args.env_config}.yaml")
     env_type = env_cfg.get("env_type", env_cfg["name"])
 
