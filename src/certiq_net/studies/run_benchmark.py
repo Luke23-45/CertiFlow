@@ -27,15 +27,10 @@ import argparse
 import json
 import sys
 from collections import OrderedDict
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
-
-if TYPE_CHECKING:
-    import torch
 
 # ---------------------------------------------------------------------------
 # Benchmark environment definitions
@@ -93,150 +88,6 @@ BASELINE_COLUMNS = ["c-mu", "MW", "MP", "FP", "PPO", "PPO BC", "PPO WC"]
 ALL_COLUMNS = list(BASELINE_COLUMNS) + ["CertiQ (ours)"]
 
 
-# ---------------------------------------------------------------------------
-# Environment/lambda/draw helpers
-# ---------------------------------------------------------------------------
-
-
-def _load_env_config(env_name: str, qgym_root: Path) -> dict:
-    """Load a QGym environment YAML config, resolving data files."""
-    import yaml
-
-    env_yaml = qgym_root / "configs" / "env" / f"{env_name}.yaml"
-    if not env_yaml.exists():
-        raise FileNotFoundError(f"Env config not found: {env_yaml}")
-
-    with open(env_yaml) as f:
-        cfg = yaml.safe_load(f)
-
-    env_type = cfg.get("env_type", cfg["name"])
-    data_dir = qgym_root / "configs" / "env_data" / env_type
-
-    if cfg.get("network") is None:
-        cfg["network"] = np.load(data_dir / f"{env_type}_network.npy")
-    if cfg.get("mu") is None:
-        cfg["mu"] = np.load(data_dir / f"{env_type}_mu.npy")
-
-    import torch
-    cfg["network"] = torch.tensor(cfg["network"], dtype=torch.float)
-    cfg["mu"] = torch.tensor(cfg["mu"], dtype=torch.float)
-
-    lam_params = cfg["lam_params"]
-    if lam_params.get("val") is None:
-        lam_params["val"] = np.load(data_dir / f"{env_type}_lam.npy")
-    else:
-        lam_params["val"] = np.array(lam_params["val"], dtype=float)
-
-    if cfg.get("queue_event_options") == "custom":
-        cfg["queue_event_options"] = torch.tensor(
-            np.load(data_dir / f"{env_type}_delta.npy"), dtype=torch.float
-        )
-    elif isinstance(cfg.get("queue_event_options"), list):
-        cfg["queue_event_options"] = torch.tensor(cfg["queue_event_options"], dtype=torch.float)
-
-    if "server_pool_size" not in cfg or cfg["server_pool_size"] is None:
-        cfg["server_pool_size"] = torch.ones(cfg["network"].shape[0])
-
-    return cfg
-
-
-def _make_lam_fn(env_config: dict) -> Callable:
-    lam_type = env_config["lam_type"]
-    lam_params = env_config["lam_params"]
-    lam_base = lam_params["val"]
-
-    if lam_type == "constant":
-        def lam_fn(_t, rng=None, batch=None):  # noqa: ARG001
-            return lam_base
-    elif lam_type == "step":
-        t_step = lam_params["t_step"]
-        val1 = np.array(lam_params["val1"], dtype=float)
-        val2 = np.array(lam_params["val2"], dtype=float)
-
-        def lam_fn(t, rng=None, batch=None):  # noqa: ARG001
-            t_np = t.cpu().numpy() if hasattr(t, "cpu") else t
-            is_surge = 1.0 * (t_np <= t_step)
-            return is_surge * val1 + (1 - is_surge) * val2
-    elif lam_type == "hyper":
-        scale = lam_params.get("scale", 0.8)
-
-        def lam_fn(t, rng=None, batch=None):  # noqa: ARG001
-            if rng is None or batch is None:
-                return lam_base
-            lam_2d = lam_base.reshape((1, len(lam_base))).repeat(batch, axis=0)
-            switch = rng.binomial(1, 0.5, (batch, 1))
-            return switch * (lam_2d / (1 + scale)) + (1 - switch) * (lam_2d / (1 - scale))
-    else:
-        raise ValueError(f"Unknown lam_type: {lam_type}")
-
-    return lam_fn
-
-
-def _make_draw_fns(env_config: dict, lam_fn: Callable) -> tuple[Callable, Callable]:
-    orig_q = env_config["network"].shape[1]
-    service_type = env_config.get("service_type", "exponential")
-    hyper_scale = env_config.get("lam_params", {}).get("scale", 0.8)
-
-    import torch
-
-    def draw_service(self, sim_time):
-        def service_dists(state, batch, t):
-            if service_type == "hyper":
-                coins = state.binomial(1, 0.5, size=(batch, orig_q))
-                a = state.exponential((1 + hyper_scale), (batch, orig_q))
-                b = state.exponential((1 - hyper_scale), (batch, orig_q))
-                return coins * a + (1 - coins) * b
-            return state.exponential(1, (batch, orig_q))
-        return torch.tensor(service_dists(self.state, self.batch, sim_time)).to(self.device)
-
-    def draw_inter_arrivals(self, sim_time):
-        def inter_arrival_dists(state, batch, t):
-            exps = state.exponential(1, (batch, orig_q))
-            lam_rate = lam_fn(t, rng=state, batch=batch)
-            return exps / lam_rate
-        return torch.tensor(inter_arrival_dists(self.state, self.batch, sim_time)).to(self.device)
-
-    return draw_service, draw_inter_arrivals
-
-
-# ---------------------------------------------------------------------------
-# Model instantiation
-# ---------------------------------------------------------------------------
-
-
-def _build_model(env_config: dict, device: str, model_config_path: Path | None) -> torch.nn.Module:
-    import yaml
-
-    from certiq_net.dispatcher.certiq.index_model import CertiQIndexModel
-
-    if model_config_path is not None and model_config_path.exists():
-        with open(model_config_path) as f:
-            cfg = yaml.safe_load(f)
-            if "model" in cfg:
-                cfg = cfg["model"]
-    else:
-        cfg = {}
-
-    N = env_config["network"].shape[1]
-    model = CertiQIndexModel(
-        N=N,
-        hidden_dim=cfg.get("hidden_dim", 128),
-        tau=cfg.get("tau", 1.0),
-        exploration_temperature=cfg.get("exploration_temperature", 1.5),
-        C=cfg.get("C", 20.0),
-        beta=cfg.get("beta", 1.0),
-        cost_fn=cfg.get("cost_fn", "qmd"),
-        d_xi=cfg.get("d_xi", 0),
-        encoder_layers=cfg.get("encoder_layers", 2),
-        num_heads=cfg.get("num_heads", 4),
-        num_inducing_points=cfg.get("num_inducing_points", 4),
-        dropout=cfg.get("dropout", 0.0),
-        constraint_mode=cfg.get("constraint_mode", "lagrangian"),
-        cost_learner_hidden_dim=cfg.get("cost_learner_hidden_dim", 64),
-    )
-    return model.to(device)
-
-
 def _resolve_checkpoint(
     env_name: str,
     checkpoint: Path | None,
@@ -280,59 +131,19 @@ def evaluate_single(
     model_config_path: Path | None = None,
     timeout: float = 600.0,  # noqa: ARG001
 ) -> dict:
-    """Evaluate one environment, return results dict matching evaluate.py output."""
-    import torch
-    sys.path.insert(0, str(qgym_root))
-    from main.trainer import Trainer  # type: ignore[import-untyped]
+    """Evaluate one environment using the RL/PPO pipeline."""
+    from certiq_net.studies.qgym_eval.evaluate import evaluate_checkpoint
 
-    from certiq_net.studies.qgym_eval.policy import CertiQPolicy
-
-    env_config = _load_env_config(env_name, qgym_root)
-    if test_steps is not None:
-        env_config["test_T"] = test_steps
-
-    model = _build_model(env_config, device, model_config_path)
-    ckpt = torch.load(str(checkpoint_path), map_location=device, weights_only=True)
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        sd = ckpt["state_dict"]
-        cleaned = {k.removeprefix("model."): v for k, v in sd.items() if k.startswith("model.")}
-        model.load_state_dict(cleaned, strict=True)
-    elif isinstance(ckpt, dict):
-        model.load_state_dict(ckpt, strict=True)
-    else:
-        model.load_state_dict(ckpt, strict=True)
-    model.to(device)
-    model.eval()
-
-    policy = CertiQPolicy(model, device=device)
-    lam_fn = _make_lam_fn(env_config)
-    draw_service, draw_inter_arrivals = _make_draw_fns(env_config, lam_fn)
-
-    model_config = {
-        "name": "certiq",
-        "env": {
-            "device": device,
-            "env_temp": 1.0,
-            "test_seed": seed,
-            "test_restart": True,
-            "train_restart": False,
-            "print_grads": False,
-        },
-        "opt": {"test_batch": test_batch, "train_batch": 1},
-        "policy": {"test_policy": "linear_assigment", "train_policy": "linear_assigment"},
-    }
-
-    trainer = Trainer(
-        model_config, env_config, policy, optimizer=None,
-        draw_service=draw_service,
-        draw_inter_arrivals=draw_inter_arrivals,
-        experiment_name=f"{env_name}_certiq",
+    return evaluate_checkpoint(
+        env_name=env_name,
+        checkpoint_path=checkpoint_path,
+        qgym_root=qgym_root,
+        device=device,
+        test_batch=test_batch,
+        test_steps=test_steps,
+        seed=seed,
+        model_config_path=model_config_path,
     )
-
-    trainer.test_epoch(0)
-    result = trainer.test_loss[-1] if trainer.test_loss else {}
-    result["env_name"] = env_name
-    return result
 
 
 # ---------------------------------------------------------------------------

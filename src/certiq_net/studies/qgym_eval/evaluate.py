@@ -1,17 +1,15 @@
-"""Evaluate a trained CertiQIndexModel inside QGym's discrete-event simulator.
+"""Evaluate a trained CertiQSB3Policy using the QGym RL/PPO pipeline.
+
+Uses the identical evaluation code path as QGym's ``parallel_eval``
+callback (``load_rl_p_env`` + ``model.predict`` + ``env.step``) so
+results are directly comparable with baseline policies trained via
+the same pipeline.
 
 Usage
 -----
-    # With QGym submodule at extern/QGym:
     python -m certiq_net.studies.qgym_eval.evaluate ^
         --env reentrant_2 ^
-        --checkpoint path/to/model.pt
-
-    # Or specify qgym-root if QGym is elsewhere:
-    python -m certiq_net.studies.qgym_eval.evaluate ^
-        --env criss_cross_bh ^
-        --checkpoint path/to/model.pt ^
-        --qgym-root /path/to/QGym
+        --checkpoint path/to/checkpoint.pt
 """
 
 from __future__ import annotations
@@ -20,37 +18,47 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import torch
 
+import certiq_net
+from certiq_net.studies.qgym_eval.train.certiq_sb3_policy import CertiQSB3Policy
+from certiq_net.studies.qgym_eval.train.qgym_import import load_rl_p_env
+
+
+class Obs(NamedTuple):
+    queues: torch.Tensor
+    time: torch.Tensor
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate CertiQIndexModel inside QGym discrete-event simulator"
+        description="Evaluate CertiQSB3Policy using the QGym RL pipeline"
     )
     parser.add_argument("--env", type=str, default="reentrant_2",
-                        help="QGym environment name (matches configs/env/<name>.yaml)")
+                        help="QGym environment name")
     parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to model checkpoint (.pt file)")
+                        help="Path to checkpoint (.pt file)")
     parser.add_argument("--device", type=str, default="cpu",
-                        help="Torch device (cpu, cuda, mps)")
+                        help="Torch device")
     parser.add_argument("--test-batch", type=int, default=100,
-                        help="Number of parallel QGym environments for evaluation")
+                        help="Number of parallel environments")
     parser.add_argument("--test-steps", type=int, default=None,
-                        help="Override env test_T (default: use env config value)")
+                        help="Override env test_T")
     parser.add_argument("--qgym-root", type=str, default=None,
-                        help="Path to QGym root (default: <project_root>/extern/QGym)")
+                        help="Path to QGym root")
     parser.add_argument("--output-dir", type=str, default="results",
-                        help="Directory to save results JSON (default: results/)")
+                        help="Output directory for results JSON")
     parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducibility")
+                        help="Random seed")
     parser.add_argument("--model-config", type=str, default=None,
-                        help="Path to model config YAML (default: configs/model/certiq_index.yaml)")
+                        help="Path to model config YAML")
     return parser
 
 
-def load_env_config(env_name: str, qgym_root: Path) -> dict:
+def _load_env_config(env_name: str, qgym_root: Path) -> dict:
     import yaml
 
     env_yaml = qgym_root / "configs" / "env" / f"{env_name}.yaml"
@@ -93,87 +101,17 @@ def load_env_config(env_name: str, qgym_root: Path) -> dict:
     return cfg
 
 
-def build_model_config(device: str, test_batch: int) -> dict:
-    return {
-        "name": "certiq",
-        "env": {
-            "device": device,
-            "env_temp": 1.0,
-            "test_seed": 42,
-            "test_restart": True,
-            "train_restart": False,
-            "print_grads": False,
-        },
-        "opt": {"test_batch": test_batch, "train_batch": 1},
-        "policy": {"test_policy": "linear_assigment", "train_policy": "linear_assigment"},
-    }
+def _constant_lr(_):
+    return 1e-4
 
 
-def make_lam_fn(env_config: dict):
-    lam_type = env_config["lam_type"]
-    lam_params = env_config["lam_params"]
-    lam_r_value = lam_params["val"]
-
-    if lam_type == "constant":
-        def lam_fn(t):
-            return lam_r_value
-
-    elif lam_type == "step":
-        t_step = lam_params["t_step"]
-        val1 = np.array(lam_params["val1"], dtype=float)
-        val2 = np.array(lam_params["val2"], dtype=float)
-
-        def lam_fn(t):
-            is_surge = 1 * (t <= t_step)
-            return is_surge * val1 + (1 - is_surge) * val2
-
-    elif lam_type == "hyper":
-        scale = lam_params.get("scale", 0.8)
-
-        def lam_fn(t, rng=None, batch=None):
-            if rng is None or batch is None:
-                return lam_r_value
-            lam_r_2d = lam_r_value.reshape((1, len(lam_r_value))).repeat(batch, axis=0)
-            switch = rng.binomial(1, 0.5, (batch, 1))
-            return switch * (lam_r_2d / (1 + scale)) + (1 - switch) * (lam_r_2d / (1 - scale))
-
-    else:
-        raise ValueError(f"Unknown lam_type: {lam_type}")
-
-    return lam_fn
-
-
-def make_draw_fns(env_config: dict, lam_fn):
-    orig_q = env_config["network"].shape[1]
-    service_type = env_config.get("service_type", "exponential")
-    hyper_scale = env_config.get("lam_params", {}).get("scale", 0.8)
-
-    def draw_service(self, time):
-        def service_dists(state, batch, t):
-            if service_type == "hyper":
-                coins = state.binomial(1, 0.5, size=(batch, orig_q))
-                a = state.exponential((1 + hyper_scale), (batch, orig_q))
-                b = state.exponential((1 - hyper_scale), (batch, orig_q))
-                return coins * a + (1 - coins) * b
-            return state.exponential(1, (batch, orig_q))
-        service = torch.tensor(service_dists(self.state, self.batch, time)).to(self.device)
-        return service
-
-    def draw_inter_arrivals(self, time):
-        def inter_arrival_dists(state, batch, t):
-            exps = state.exponential(1, (batch, orig_q))
-            lam_rate = lam_fn(t, rng=state, batch=batch)
-            return exps / lam_rate
-        interarrivals = torch.tensor(inter_arrival_dists(self.state, self.batch, time)).to(self.device)
-        return interarrivals
-
-    return draw_service, draw_inter_arrivals
-
-
-def instantiate_model(env_config: dict, device: str, model_config_path: Path | None = None) -> torch.nn.Module:
+def _construct_policy(
+    env_config: dict,
+    env_sample,
+    device: str,
+    model_config_path: Path | None = None,
+) -> CertiQSB3Policy:
     import yaml
-
-    from certiq_net.dispatcher.certiq.index_model import CertiQIndexModel
 
     if model_config_path is not None and model_config_path.exists():
         with open(model_config_path) as f:
@@ -183,123 +121,188 @@ def instantiate_model(env_config: dict, device: str, model_config_path: Path | N
     else:
         cfg = {}
 
-    N = env_config["network"].shape[1]
-    model = CertiQIndexModel(
-        N=N,
-        hidden_dim=cfg.get("hidden_dim", 128),
-        tau=cfg.get("tau", 1.0),
-        exploration_temperature=cfg.get("exploration_temperature", 1.5),
-        C=cfg.get("C", 20.0),
-        beta=cfg.get("beta", 1.0),
-        cost_fn=cfg.get("cost_fn", "qmd"),
-        d_xi=cfg.get("d_xi", 0),
-        encoder_layers=cfg.get("encoder_layers", 2),
-        num_heads=cfg.get("num_heads", 4),
-        num_inducing_points=cfg.get("num_inducing_points", 4),
-        dropout=cfg.get("dropout", 0.0),
-        constraint_mode=cfg.get("constraint_mode", "lagrangian"),
-        cost_learner_hidden_dim=cfg.get("cost_learner_hidden_dim", 64),
-    )
-    model.eval()
-    return model
+    network = env_config["network"].to(device)
+    mu = env_config["mu"].to(device)
 
-
-def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
-    raw = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
-    if isinstance(raw, dict) and "state_dict" in raw:
-        sd = raw["state_dict"]
-        cleaned = {
-            k.removeprefix("model."): v
-            for k, v in sd.items()
-            if k.startswith("model.")
-        }
-        missing, unexpected = model.load_state_dict(cleaned, strict=True)
-    elif isinstance(raw, dict):
-        missing, unexpected = model.load_state_dict(raw, strict=True)
+    if hasattr(env_sample, "queue_event_options") and env_sample.queue_event_options is not None:
+        opts = env_sample.queue_event_options
+        D = opts.to(device) if torch.is_tensor(opts) else torch.tensor(opts).to(device)
     else:
-        raise TypeError(f"Unexpected checkpoint format: {type(raw)}")
+        D = torch.tensor(0.0).to(device)
+
+    policy = CertiQSB3Policy(
+        observation_space=env_sample.observation_space,
+        action_space=env_sample.action_space,
+        lr_schedule=_constant_lr,
+        network=network,
+        mu=mu,
+        alpha=torch.tensor(0.0).to(device),
+        D=D,
+        tau=cfg.get("tau", 1.0),
+        randomize=True,
+        scale=cfg.get("scale", 20),
+        rescale_v=False,
+        time_f=False,
+        net_arch=dict(pi=[], vf=[]),
+    )
+    policy.to(device)
+    policy.eval()
+    return policy
+
+
+def _load_checkpoint_into_policy(policy: CertiQSB3Policy, checkpoint_path: str, device: str) -> None:
+    raw = torch.load(str(checkpoint_path), map_location=device, weights_only=True)
+
+    if not isinstance(raw, dict):
+        raise TypeError(f"Expected dict checkpoint, got {type(raw)}")
+
+    if "state_dict" in raw:
+        raw = raw["state_dict"]
+
+    head_sd = {}
+    for k, v in raw.items():
+        key = k
+        if key.startswith("model."):
+            key = key[6:]
+        if key.startswith("marginal_index_head."):
+            key = key[21:]
+        if key.startswith("index_head."):
+            key = key[11:]
+        if key.startswith("encoder.") or key.startswith("index_head.") or key.startswith("value_head."):
+            head_sd[key] = v
+
+    if head_sd:
+        policy.marginal_index_head.load_state_dict(head_sd, strict=True)
+        print(f"Loaded checkpoint into policy.marginal_index_head ({len(head_sd)} keys)", file=sys.stderr)
+        return
+
+    missing, unexpected = policy.load_state_dict(raw, strict=False)
     if missing:
         print(f"Warning: missing keys: {missing}", file=sys.stderr)
     if unexpected:
-        print(f"Warning: unexpected keys: {unexpected}", file=sys.stderr)
+        redundant = {"action_net", "value_net", "pi_features_extractor",
+                     "vf_features_extractor", "mlp_extractor"}
+        real_unexpected = [k for k in unexpected if k.split(".")[0] not in redundant]
+        if real_unexpected:
+            print(f"Warning: unexpected keys: {real_unexpected}", file=sys.stderr)
+
     print(f"Loaded checkpoint: {checkpoint_path}", file=sys.stderr)
 
 
-def run_evaluation(args: argparse.Namespace) -> dict:
-    import certiq_net
+def evaluate_checkpoint(
+    env_name: str,
+    checkpoint_path: Path,
+    *,
+    qgym_root: Path,
+    device: str = "cpu",
+    test_batch: int = 100,
+    test_steps: int | None = None,
+    seed: int = 42,
+    model_config_path: Path | None = None,
+) -> dict:
+    env_config = _load_env_config(env_name, qgym_root)
+    if test_steps is not None:
+        env_config["test_T"] = test_steps
+    test_T = env_config.get("test_T", 10000)
 
-    # Resolve project root from package location
+    orig_q = env_config["network"].shape[1]
+
+    def _make_env(s):
+        return load_rl_p_env(
+            env_config=env_config,
+            temp=1.0,
+            batch=1,
+            seed=s,
+            policy_name="vanilla",
+            device=torch.device(device),
+        )
+
+    envs = [_make_env(seed + i) for i in range(test_batch)]
+    env_sample = envs[0]
+
+    policy = _construct_policy(env_config, env_sample, device, model_config_path)
+    _load_checkpoint_into_policy(policy, str(checkpoint_path), device)
+
+    obs_batch: list[Obs] = []
+    total_cost_batch: list[torch.Tensor] = []
+    total_time_batch: list[torch.Tensor] = []
+    twql_batch: list[torch.Tensor] = []
+
+    for i in range(test_batch):
+        obs_np, _ = envs[i].reset()
+        obs_batch.append(Obs(queues=torch.tensor(obs_np, dtype=torch.float).to(device),
+                             time=torch.tensor(0.0).to(device)))
+        total_cost_batch.append(torch.tensor(0.0).to(device))
+        total_time_batch.append(torch.tensor(0.0).to(device))
+        twql_batch.append(torch.zeros(orig_q).to(device))
+
+    for _ in range(test_T):
+        batch_queue = torch.cat([o.queues.view(1, -1) for o in obs_batch], dim=0)
+        raw_actions, _ = policy.predict(batch_queue.cpu().numpy())
+        action = torch.tensor(raw_actions).float().to(device)
+
+        for i in range(test_batch):
+            _, _, _, _, info = envs[i].step(action[i])
+            obs_batch[i] = info["obs"]
+            total_cost_batch[i] = total_cost_batch[i] + info["cost"]
+            total_time_batch[i] = total_time_batch[i] + info["event_time"]
+            twql_batch[i] = twql_batch[i] + info["queues"] * info["event_time"]
+
+    test_cost_batch = torch.stack([
+        total_cost_batch[i] / total_time_batch[i]
+        for i in range(test_batch)
+    ])
+    test_loss = test_cost_batch.mean().item()
+    test_loss_std = test_cost_batch.std().item()
+
+    mean_queue_lengths = torch.stack([
+        twql_batch[i] / total_time_batch[i]
+        for i in range(test_batch)
+    ]).mean(dim=0).cpu().tolist()
+    mean_queue_length_avg = float(np.mean(mean_queue_lengths))
+
+    result = {
+        "env_name": env_name,
+        "test_loss": test_loss,
+        "test_loss_std": test_loss_std,
+        "mean_queue_length": mean_queue_lengths,
+        "mean_queue_length_avg": mean_queue_length_avg,
+    }
+
+    return result
+
+
+def run_evaluation(args: argparse.Namespace) -> dict:
     project_root = Path(certiq_net.__file__).resolve().parents[2]
 
-    if args.qgym_root:
-        qgym_root = Path(args.qgym_root).resolve()
-    else:
-        qgym_root = project_root / "extern" / "QGym"
-
+    qgym_root = Path(args.qgym_root).resolve() if args.qgym_root else project_root / "extern" / "QGym"
     if not qgym_root.exists():
         print(f"QGym root not found: {qgym_root}", file=sys.stderr)
-        print("Pass --qgym-root to point to the QGym directory.", file=sys.stderr)
         sys.exit(1)
 
-    sys.path.insert(0, str(qgym_root))
-    from main.trainer import Trainer
-
-    from certiq_net.studies.qgym_eval.policy import CertiQPolicy
-
-    device = args.device
-    env_name = args.env
-    seed = args.seed
-
-    # Set seeds for reproducibility
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    print(f"Loading env: {env_name}", file=sys.stderr)
-    env_config = load_env_config(env_name, qgym_root)
-    if args.test_steps is not None:
-        old_T = env_config.get("test_T", "default")
-        env_config["test_T"] = args.test_steps
-        print(f"  test_T: {old_T} -> {args.test_steps}", file=sys.stderr)
-
-    # Resolve model config path
     if args.model_config:
         model_config_path = Path(args.model_config).resolve()
     else:
         model_config_path = project_root / "configs" / "model" / "certiq_index.yaml"
 
-    print(f"Instantiating CertiQ model for N={env_config['network'].shape[1]}", file=sys.stderr)
-    model = instantiate_model(env_config, device, model_config_path=model_config_path)
+    result = evaluate_checkpoint(
+        env_name=args.env,
+        checkpoint_path=Path(args.checkpoint),
+        qgym_root=qgym_root,
+        device=args.device,
+        test_batch=args.test_batch,
+        test_steps=args.test_steps,
+        seed=args.seed,
+        model_config_path=model_config_path,
+    )
 
-    print(f"Loading checkpoint: {args.checkpoint}", file=sys.stderr)
-    load_checkpoint(model, args.checkpoint)
-    model.to(device)
-
-    policy = CertiQPolicy(model, device=device)
-    lam_fn = make_lam_fn(env_config)
-    draw_service, draw_inter_arrivals = make_draw_fns(env_config, lam_fn)
-    model_config = build_model_config(device, args.test_batch)
-    model_config["env"]["test_seed"] = seed
+    print(f"\nResults for {args.env}:", file=sys.stderr)
+    print(f"  test_loss:     {result['test_loss']:.4f} +/- {result['test_loss_std']:.4f}", file=sys.stderr)
+    print(f"  mean queue len: {result['mean_queue_length_avg']:.4f}", file=sys.stderr)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    experiment_name = f"{env_name}_certiq"
-
-    print(f"Creating Trainer (test_batch={args.test_batch}, T={env_config.get('test_T', 10000)})", file=sys.stderr)
-    trainer = Trainer(
-        model_config, env_config, policy, optimizer=None,
-        draw_service=draw_service,
-        draw_inter_arrivals=draw_inter_arrivals,
-        experiment_name=experiment_name,
-    )
-
-    print("Running test_epoch...", file=sys.stderr)
-    trainer.test_epoch(0)
-
-    result = trainer.test_loss[-1] if trainer.test_loss else {}
-    print(f"\nResults: test_loss={result.get('test_loss'):.4f} +/- {result.get('test_loss_std'):.4f}", file=sys.stderr)
-    print(f"Queue lengths: {result.get('mean_queue_length')}", file=sys.stderr)
-
-    out_path = output_dir / f"{experiment_name}_results.json"
+    out_path = output_dir / f"{args.env}_certiq_results.json"
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2)
     print(f"Saved: {out_path}", file=sys.stderr)

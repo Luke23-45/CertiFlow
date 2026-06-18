@@ -4,43 +4,51 @@ Learned certified dispatch for queueing systems, powered by [QGym](https://githu
 
 **CertiQ-Net** introduces a **learned marginal-cost index policy** with a **closed-form certificate guarantee** for queueing network control. The policy is a Set Transformer that maps per-queue state (queue length, service rate) to dispatch probabilities, with a certificate that the expected delay cost stays within a provable budget.
 
+Training and evaluation use QGym's **identical RL/PPO pipeline** (`CustomPPOTrainer` + `CustomRolloutBuffer` + `parallel_eval`) — the CertiQ model drops in as a policy class, same as `Vanilla` or `WC` baselines, ensuring fair comparison.
+
 ## Architecture
 
 ```
-┌──────────────────────┐
-│   QGym Environment   │  Discrete-event queueing simulation
-│ DiffDiscreteEventSys │  (reentrant, criss-cross, parallel server, ...)
-└──────┬───────────────┘
-       │ queues (B, Q), time (B, 1)
-       ▼
-┌──────────────────────────────┐
-│       CertiQPolicy           │  Wraps model for QGym interface
-│  (policy.py)                 │  Converts per-queue pi → (B, S, Q) priority
-└──────┬───────────────────────┘
-       │ Q (B, Q), μ_eff (B, Q)
-       ▼
+┌─────────────────────────────────────────┐
+│           QGym Environment              │  Discrete-event queueing simulation
+│    DiffDiscreteEventSystem              │  (reentrant, criss-cross, parallel, ...)
+│    action_space: Box(0, 1) (S, Q)      │
+│    observation_space: Box(0, inf) (Q,)  │
+└────────┬────────────────────────────────┘
+         │ queues (B, Q)
+         ▼
 ┌──────────────────────────────────────────────────────┐
-│                  CertiQIndexModel                     │
+│               CertiQSB3Policy                         │
+│            (ActorCriticPolicy subclass)               │
 │  ┌──────────────────────────────────────────────────┐│
-│  │ DispatchInteractionEncoder                       ││
-│  │  (Set Transformer with Induced Attention)        ││
-│  │  token_features: [Q, μ, log(1+Q), log(μ), ...]  ││
-│  └──────────────┬───────────────────────────────────┘│
-│                 ▼ z_local (B, N, d), z_global (B, d) │
-│  ┌──────────────────────────────────────────────────┐│
-│  │ MarginalIndexHead                                ││
-│  │  concat(z_local, z_global) → MLP → per-queue     ││
-│  │  logits (B, Q) → softmax → dispatch policy π    ││
-│  └──────────────┬───────────────────────────────────┘│
-│                 ▼                                     │
-│  ┌──────────────────────────────────────────────────┐│
-│  │ Certificate Mechanism                            ││
-│  │  budget = min_i cost_i + C                      ││
-│  │  • Lagrangian: constraint in PPO loss            ││
-│  │  • Projection: Differentiable KL projection      ││
-│  │    onto constraint set {π | E_π[cost] ≤ budget} ││
+│  │  MarginalIndexHead                               ││
+│  │  ┌──────────────────────────────────────────────┐││
+│  │  │ DispatchInteractionEncoder                    │││
+│  │  │  (Set Transformer with Induced Attention)    │││
+│  │  │  token_features: [Q, μ, log(1+Q), ...]      │││
+│  │  └──────────────┬───────────────────────────────┘││
+│  │                 ▼ z_local, z_global              ││
+│  │  ┌──────────────────────────────────────────────┐││
+│  │  │ index_head MLP → logits (B, Q)              │││
+│  │  │ value_head MLP → value (B, 1)               │││
+│  │  └──────────────────────────────────────────────┘││
+│  │  output: π = softmax(-logits / τ)               ││
+│  │  expanded to per-server priority (B, S, Q)       ││
 │  └──────────────────────────────────────────────────┘│
-└──────────────────────────────────────────────────────┘
+│  SB3 components:                                     │
+│  • pi_features_extractor = encoder (policy opt.)     │
+│  • action_net = index_head                           │
+│  • value_net = value_head                            │
+│  • predict() → (action_np, action_probs_np)          │
+└────────┬────────────────────────────────────────────┘
+         │ action (B, S, Q) — one-hot per server
+         ▼
+┌─────────────────────────────────────────┐
+│      CustomPPOTrainer (unchanged)       │  QGym's standard PPO trainer
+│  • collect_rollouts via policy()        │  Same code path for all policies
+│  • train() via evaluate_actions()       │
+│  • optional Lagrangian penalty loss     │
+└─────────────────────────────────────────┘
 ```
 
 ## Quick Start
@@ -60,50 +68,47 @@ pytest tests/ -v
 
 ## Training a Model
 
-```bash
-python -m certiq_net.studies.train \
-    --env reentrant_2 \
-    --epochs 200 \
-    --lr 3e-4 \
-    --eval-interval 20
+Uses QGym's PPO pipeline. The first positional arg is the **policy-config** stem (from `extern/QGym/RL/policy_configs/`) and the second is the **env-config** stem (from `extern/QGym/configs/env/`).
 
-# Optional: specify device, resume from checkpoint
-python -m certiq_net.studies.train \
-    --env criss_cross_bh \
-    --epochs 300 \
-    --device cuda \
-    --resume training_results/checkpoint_epoch_0050.pt
+```bash
+python -m certiq_net.studies.qgym_eval.train.train \
+    vanilla \
+    reentrant_2
+
+# With Lagrangian certificate constraint
+python -m certiq_net.studies.qgym_eval.train.train \
+    vanilla \
+    criss_cross_bh \
+    --use-lagrangian \
+    --lr-nu 1e-3
 ```
 
 ### Training Arguments
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--env` | `reentrant_2` | QGym environment name |
-| `--epochs` | `200` | Number of training epochs |
-| `--train-steps` | env default | Steps per training episode |
-| `--device` | `cpu` | Torch device |
-| `--lr` | `3e-4` | Policy learning rate |
-| `--lagrangian-lr` | `1e-2` | Lagrangian multiplier learning rate |
-| `--seed` | `42` | Random seed |
-| `--eval-interval` | `20` | Epochs between evaluations |
-| `--eval-batch` | `50` | Evaluation parallel environments |
-| `--eval-steps` | `5000` | Evaluation trajectory length |
-| `--output-dir` | `training_results` | Checkpoint and log directory |
-| `--resume` | None | Resume from checkpoint |
+| Argument | Description |
+|----------|-------------|
+| `policy_config` | Policy config stem (e.g. `vanilla`) |
+| `env_config` | Env config stem (e.g. `reentrant_2`) |
+| `--use-lagrangian` | Enable CertiQ Lagrangian constraint in PPO loss |
+| `--lr-nu` | Learning rate for the Lagrangian dual variable (default: `1e-3`) |
+
+Hyperparameters (learning rate, batch size, architecture, etc.) are set in the policy config YAML files under `extern/QGym/RL/policy_configs/`.
 
 ## Evaluate a Trained Model
 
+Evaluates a checkpoint using the identical RL/PPO code path as training (`load_rl_p_env` + `model.predict` + `env.step`).
+
 ```bash
+# Single environment
 python -m certiq_net.studies.qgym_eval.evaluate \
     --env reentrant_2 \
-    --checkpoint training_results/final_model_state.pt \
+    --checkpoint path/to/checkpoint.pt \
     --test-batch 100
 
 # With hyperexponential arrivals
 python -m certiq_net.studies.qgym_eval.evaluate \
     --env reentrant_2_hyper \
-    --checkpoint checkpoints/reentrant_2_hyper.pt
+    --checkpoint path/to/checkpoint.pt
 ```
 
 ### Evaluation Arguments
@@ -111,7 +116,7 @@ python -m certiq_net.studies.qgym_eval.evaluate \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--env` | `reentrant_2` | QGym environment name |
-| `--checkpoint` | required | Trained model `.pt` file |
+| `--checkpoint` | required | Trained model `.pt` file (`CertiQSB3Policy` or `MarginalIndexHead` state dict) |
 | `--device` | `cpu` | Torch device |
 | `--test-batch` | `100` | Parallel environments for evaluation |
 | `--test-steps` | env default | Simulation horizon |
@@ -119,6 +124,30 @@ python -m certiq_net.studies.qgym_eval.evaluate \
 | `--model-config` | `configs/model/certiq_index.yaml` | Model architecture config |
 | `--qgym-root` | `./extern/QGym` | Path to QGym directory |
 | `--output-dir` | `results` | Results output directory |
+
+Checkpoint loading handles multiple formats automatically: `CertiQSB3Policy` state dicts, `MarginalIndexHead` state dicts, and legacy `CertiQIndexModel` formats — all with automatic key remapping.
+
+## Batch Benchmark
+
+Run the full benchmark suite across all environments with automatic LaTeX/Markdown table generation:
+
+```bash
+# Single checkpoint evaluated on all envs (generalization test)
+python -m certiq_net.studies.run_benchmark \
+    --checkpoint path/to/model.pt \
+    --output-dir benchmark_results
+
+# Per-environment checkpoints
+python -m certiq_net.studies.run_benchmark \
+    --checkpoint-dir checkpoints/ \
+    --output-dir benchmark_results
+
+# Regenerate tables from existing results (no re-evaluation)
+python -m certiq_net.studies.run_benchmark \
+    --results-dir benchmark_results/results \
+    --output-dir benchmark_results \
+    --table-only
+```
 
 ## Benchmark Environments
 
@@ -141,16 +170,15 @@ Default architecture (`configs/model/certiq_index.yaml`):
 
 ```yaml
 model:
-  _target_: certiq_net.dispatcher.certiq.index_model.CertiQIndexModel
-  N: 8                       # Number of queues
   hidden_dim: 128            # Transformer embedding dimension
   tau: 1.0                   # Softmax temperature
-  exploration_temperature: 1.5  # Training exploration temperature
-  C: 20.0                    # Certificate slack budget constant
-  cost_fn: qmd               # Cost function: "sed", "qmd", or "learned"
+  d_xi: 0                    # Exogenous context dimension
   encoder_layers: 2          # Set Transformer layers
   num_heads: 4               # Attention heads
   num_inducing_points: 4     # Induced attention points (0 = full self-attention)
+  dropout: 0.0
+  C: 20.0                    # Certificate slack budget constant
+  cost_fn: qmd               # Cost function: "sed", "qmd", or "learned"
   constraint_mode: lagrangian  # "lagrangian", "projection", or "unconstrained"
 ```
 
@@ -158,7 +186,7 @@ model:
 
 | Mode | Description | Training Loss |
 |------|-------------|---------------|
-| `lagrangian` | Soft constraint via PPO-Lagrangian dual variable | `L = L_PPO + λ · constraint_violation` |
+| `lagrangian` | Soft constraint via PPO-Lagrangian dual variable | `L = L_PPO + ν · violation` |
 | `projection` | Hard constraint via Differentiable KL Projection | Standard PPO (constraint enforced by projection layer) |
 | `unconstrained` | Plain softmax, no certificate | Standard PPO |
 
@@ -188,11 +216,14 @@ certiq_net/
 │   │   ├── delay_geometry.py   # SED, QMD index functions
 │   │   └── types.py            # DispatcherDiagnostics, DispatcherForward
 │   ├── studies/
-│   │   ├── train.py            # PPO-Lagrangian training CLI
-│   │   ├── ppo_trainer.py      # LagrangianPPOTrainer implementation
+│   │   ├── run_benchmark.py    # Batch benchmark + LaTeX table generation
 │   │   └── qgym_eval/
-│   │       ├── evaluate.py     # Evaluation CLI
-│   │       └── policy.py       # CertiQPolicy wrapper
+│   │       ├── evaluate.py     # Standalone evaluation (RL/PPO pipeline)
+│   │       └── train/          # Training pipeline
+│   │           ├── train.py              # Training entry point
+│   │           ├── certiq_sb3_policy.py  # SB3 ActorCriticPolicy wrapper
+│   │           ├── certiq_ppo_trainer.py # CertiqPPOTrainer (Lagrangian)
+│   │           └── qgym_import.py        # QGym component imports
 │   ├── experiments/
 │   │   └── checkpoint_state.py # Checkpoint save/load utilities
 │   └── utils/
@@ -201,7 +232,7 @@ certiq_net/
 │   └── certiq_index.yaml       # Model architecture reference
 ├── tests/                      # pytest test suite
 ├── training_results/           # Checkpoints and logs (generated)
-└── extern/QGym/                # QGym simulator (git submodule)
+└── extern/QGym/                # QGym simulator (git submodule, unchanged)
 ```
 
 ## Running All Tests
