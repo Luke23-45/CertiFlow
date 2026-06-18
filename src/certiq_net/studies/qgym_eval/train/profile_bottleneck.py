@@ -57,9 +57,10 @@ class _Timer:
         self.sync = sync
 
     def __call__(self, fn, *args, **kwargs):
-        # warmup
+        print(f"  [{self.name}] warming up {self.warmup}x ...", end=" ", flush=True)
         for _ in range(self.warmup):
             fn(*args, **kwargs)
+        print(f"timing {self.reps}x ...", end=" ", flush=True)
         if self.sync:
             torch.cuda.synchronize()
         t0 = _time.perf_counter()
@@ -68,7 +69,7 @@ class _Timer:
         if self.sync:
             torch.cuda.synchronize()
         ms_per = (_time.perf_counter() - t0) * 1000 / self.reps
-        print(f"  {self.name:40s}  {ms_per:>8.2f} ms  ({self.reps}x)")
+        print(f" done.  avg {ms_per:.2f} ms")
         return ms_per
 
 
@@ -236,9 +237,12 @@ def main() -> None:
     batch_obs = single_obs.unsqueeze(0).expand(batch_size, -1).contiguous()   # (B, q)
     actors_obs = single_obs.unsqueeze(0).expand(actors, -1).contiguous()      # (A, q)
 
-    # Single action and batch action
-    action = policy(single_obs.unsqueeze(0))[0][0]  # (S, Q)
-    dq_action = action.cpu().numpy()
+    # Use a uniform priority action for env stepping — random untrained policy
+    # actions can cause the QGym event simulation to enter an infinite loop.
+    safe_action = np.ones((orig_s, orig_q), dtype=np.float32) / orig_q
+
+    # Policy action for training-component tests (needs valid graph)
+    action = policy(single_obs.unsqueeze(0))[0][0].detach()  # (S, Q)
     batch_action = action.unsqueeze(0).expand(batch_size, -1, -1).contiguous()  # (B, S, Q)
 
     print(f"\nDevice: {device_str}   Env: {env_type}   Actors: {actors}   "
@@ -251,8 +255,10 @@ def main() -> None:
 
     # ── 1. Environment stepping ─────────────────────────────────────────────
     print("\n--- QGym Environment ---")
-    t_env_single = timer("env.step (1 env, 1 step)", reps=500, warmup=50, sync=False)(
-        _run_env_step, dq, dq_action, 500
+    # Use uniform-safe action (untrained policy actions can hang the simulation)
+    env_step_reps = 200
+    t_env_single = timer("env.step (1 env, 1 step)", reps=env_step_reps, warmup=20, sync=False)(
+        _run_env_step, dq, safe_action, env_step_reps
     )
 
     # ── 2. Policy forward (single) ──────────────────────────────────────────
