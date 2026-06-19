@@ -32,6 +32,7 @@ from certiq_net.studies.qgym_eval.train.certiq_sb3_policy import CertiQSB3Policy
 from certiq_net.studies.qgym_eval.train.qgym_import import (
     load_rl_p_env,
 )
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -219,6 +220,98 @@ def _run_training_step(policy, obs_tensor, action_tensor) -> None:
     policy.zero_grad(set_to_none=True)
 
 
+# ── VecEnv comparison ────────────────────────────────────────────────────────
+
+def _compare_vec_envs(env_cfg, env_temp, policy_name, env_device_t, actors, action) -> None:
+    """Time DummyVecEnv vs SubprocVecEnv stepping `actors` envs in tandem.
+
+    Answers: does process-level parallelism beat the serial DummyVecEnv loop for
+    THIS env? Builds envs via the same make_env pattern as train.py (batch=1,
+    one seed per actor), runs a short rollout under each backend, and reports
+    ms/timestep. Failures (e.g. spawn unsupported on the platform) are caught
+    and reported, not fatal — this is a read-only diagnostic.
+    """
+    import copy
+    import sys as _sys
+
+    def _make_env(seed):
+        # Deep-copy the cfg because load_rl_p_env MUTATES it in place (sets
+        # network/mu to torch tensors), and each subprocess must get its own.
+        cfg = copy.deepcopy(env_cfg)
+        return load_rl_p_env(
+            env_config=cfg, temp=env_temp, batch=1, seed=seed,
+            policy_name=policy_name, device=env_device_t,
+        )
+
+    rollout_steps = 200
+    # action is shape (s, q); DummyVecEnv/SubprocVecEnv expect a batch of
+    # (actors, s, q) — broadcast.
+    batch_action = np.broadcast_to(action, (actors,) + action.shape).copy()
+
+    def _time_backend(name, build_fn, steps, warmup=20):
+        print(f"\n  [{name}] building {actors} envs ...", end=" ", flush=True)
+        try:
+            env = build_fn()
+        except Exception as e:  # noqa: BLE001 — diagnostic, must not abort profiler
+            print(f"FAILED to build: {type(e).__name__}: {e}")
+            return None
+        try:
+            print(f"stepping {steps}x ...", end=" ", flush=True)
+            env.reset()
+            for _ in range(warmup):
+                env.step(batch_action)
+            env.reset()
+            t0 = _time.perf_counter()
+            for _ in range(steps):
+                env.step(batch_action)
+            ms_per = (_time.perf_counter() - t0) * 1000 / steps
+            print(f" done.  {ms_per:.2f} ms/timestep ({ms_per/actors:.3f} ms/env-step)")
+            return ms_per
+        except Exception as e:  # noqa: BLE001
+            print(f"FAILED to step: {type(e).__name__}: {e}")
+            return None
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+
+    print("\n--- DummyVecEnv vs SubprocVecEnv ---")
+    print(f"  (rollout: {rollout_steps} timesteps x {actors} envs; "
+          f"torch threads = {torch.get_num_threads()})")
+
+    # Dummy: serial loop in this process.
+    dummy_fns = [(lambda s=seed: _make_env(s)) for seed in range(3003, 3003 + actors)]
+    t_dummy = _time_backend(
+        f"DummyVecEnv (x{actors})",
+        lambda: DummyVecEnv(dummy_fns),
+        rollout_steps,
+    )
+
+    # Subproc: one process per env. spawn on win32 (matches train.py), fork elsewhere.
+    start_method = "spawn" if _sys.platform == "win32" else "fork"
+    proc_fns = [(lambda s=seed: _make_env(s)) for seed in range(3003, 3003 + actors)]
+    t_subproc = _time_backend(
+        f"SubprocVecEnv (x{actors}, {start_method})",
+        lambda: SubprocVecEnv(proc_fns, start_method=start_method),
+        rollout_steps,
+    )
+
+    if t_dummy is not None and t_subproc is not None:
+        if t_subproc < t_dummy:
+            ratio = t_dummy / t_subproc
+            print(f"  >> SubprocVecEnv WINS: {ratio:.2f}x faster "
+                  f"({t_dummy:.2f} -> {t_subproc:.2f} ms/timestep). "
+                  f"Parallelism is worth pursuing.")
+        else:
+            ratio = t_subproc / t_dummy
+            print(f"  >> DummyVecEnv WINS: {ratio:.2f}x faster "
+                  f"({t_dummy:.2f} vs {t_subproc:.2f} ms/timestep). "
+                  f"IPC overhead exceeds the per-step cost — keep serial + optimize kernel.")
+    elif t_dummy is not None:
+        print("  >> SubprocVecEnv unavailable on this platform; only DummyVecEnv measured.")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -230,7 +323,16 @@ def main() -> None:
     parser.add_argument("env_config", type=str)
     parser.add_argument("--device", type=str, default=None,
                         help="Override device (e.g. 'cuda', 'cpu')")
+    parser.add_argument("--num-threads", type=int, default=None,
+                        help="Override torch.set_num_threads (default: torch default). "
+                             "For the DummyVecEnv path with tiny per-step ops, 1 often "
+                             "beats the default (avoids thread oversubscription).")
     args = parser.parse_args()
+
+    if args.num_threads is not None:
+        torch.set_num_threads(args.num_threads)
+        print(f"[profile] torch.set_num_threads({args.num_threads})")
+    print(f"[profile] torch.get_num_threads() = {torch.get_num_threads()}")
 
     # ── Load configs ────────────────────────────────────────────────────────
     policy_cfg = _load_yaml(_RL_ROOT / "policy_configs" / f"{args.policy_config}.yaml")
@@ -390,6 +492,14 @@ def main() -> None:
           f"(timed {200*200} steps, divided by 200). "
           f"True per-step ≈ {t_env_old_label/200:.3f} ms — consistent with the "
           f"steady-state {t_env_single:.3f} ms measurement above.")
+
+    # ── 1b. DummyVecEnv vs SubprocVecEnv comparison ─────────────────────────
+    # Answer the parallelism question empirically: does stepping `actors` envs
+    # across processes beat the serial DummyVecEnv loop for THIS env? The generic
+    # wisdom (SubprocVecEnv for heavy envs, DummyVecEnv for light ones) is
+    # inconclusive for a ~1ms env, so we measure. This is read-only — it does
+    # not change training behavior.
+    _compare_vec_envs(env_cfg, env_temp, policy_name, env_device_t, actors, servicing_action)
 
     # ── 2. Policy forward (single) ──────────────────────────────────────────
     print("\n--- CertiQ Policy Forward ---")

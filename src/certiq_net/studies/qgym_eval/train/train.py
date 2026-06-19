@@ -25,6 +25,10 @@ Flags
     Windows to avoid page-file limits from spawn subprocesses).
 ``--compile``
     Apply ``torch.compile`` to the policy forward pass (experimental).
+``--num-threads N``
+    Override ``torch.set_num_threads``. For the default ``DummyVecEnv`` path
+    with tiny per-step ops, ``1`` often beats the default because it avoids
+    thread oversubscription across the serial env loop.
 ``--use-lagrangian``
     Enable the CertiQ certificate constraint in the PPO loss.
 """
@@ -97,7 +101,17 @@ def main() -> None:
         "--num-actors", type=int, default=None,
         help="Override the number of actor envs (default: from policy config)",
     )
+    parser.add_argument(
+        "--num-threads", type=int, default=None,
+        help="Override torch.set_num_threads (default: torch default). For the "
+             "DummyVecEnv path with tiny per-step ops, 1 often beats the default "
+             "because it avoids thread oversubscription across the serial env loop.",
+    )
     args = parser.parse_args()
+
+    if args.num_threads is not None:
+        torch.set_num_threads(args.num_threads)
+        print(f"[train] torch.set_num_threads({args.num_threads})")
 
     # ── Load configs ────────────────────────────────────────────────────────
     policy_cfg = _load_yaml(_RL_ROOT / "policy_configs" / f"{args.policy_config}.yaml")
