@@ -1,0 +1,177 @@
+diff --git a/main/env.py b/main/env.py
+index bd913d2..2431e9c 100644
+--- a/main/env.py
++++ b/main/env.py
+@@ -40,8 +40,8 @@ class STargmin(nn.Module):
+         # Cast to float so the output dtype matches the grad path (one_hot is
+         # int64; the softmax arithmetic in the grad path promotes to float).
+         if not x.requires_grad:
+-            return F.one_hot(torch.argmin(x), num_classes = x.size()[1]).float()
+-        return F.one_hot(torch.argmin(x), num_classes = x.size()[1]) - self.softmax(-x/self.temp).detach() + self.softmax(-x/self.temp)
++            return F.one_hot(torch.argmin(x, dim=-1), num_classes = x.size()[-1]).float()
++        return F.one_hot(torch.argmin(x, dim=-1), num_classes = x.size()[-1]) - self.softmax(-x/self.temp).detach() + self.softmax(-x/self.temp)
+     
+ def allocator(action, mu, queue_counts):
+     # Pure-torch allocator. Returns (allocated_work, num_allocated).
+@@ -433,7 +433,7 @@ class DiffDiscreteEventSystem(gym.Env):
+     
+     def get_observation(self):
+         return self.queues
+-        
++         
+     def print_state(self):
+         print(f"Total Cost:\t{self.cost}")
+         print(f"Time Elapsed:\t{self.time_elapsed}")
+@@ -442,3 +442,152 @@ class DiffDiscreteEventSystem(gym.Env):
+         print(f"Arrival times:\t{self.arrival_times}")
+         # else:
+         #     print(f"Work:\t{self.work}")
++
++
++class BatchedEnv:
++    """B parallel QGym envs with batched tensor operations.
++
++    Processes one event per env per step() call, handling all B envs
++    simultaneously with vectorized operations.  Replaces the serial
++    DummyVecEnv Python loop with a single call.
++
++    Uses the same allocator() and STargmin as DiffDiscreteEventSystem.
++    Draw functions (draw_service / draw_inter_arrivals) must accept
++    ``self`` (the BatchedEnv instance) and return ``(B, q)`` tensors.
++    """
++
++    def __init__(self, network, mu, h, draw_service, draw_inter_arrivals,
++                 init_time=0, batch=50, queue_event_options=None,
++                 queue_lim=None, temp=1, seed=3003, device="cpu"):
++
++        self.device = torch.device(device) if isinstance(device, str) else device
++        self.B = batch
++        self.q = network.size()[-1]
++        self.s = network.size()[-2]
++        self.batch = self.B  # draw_* closures reference self.batch
++
++        self.network = network.repeat(batch, 1, 1).to(self.device)
++        self.mu = mu.repeat(batch, 1, 1).to(self.device)
++        self.h = torch.as_tensor(h, dtype=torch.float32, device=self.device)
++        self.temp = temp
++        self.st_argmin = STargmin(temp=temp)
++        self.eps = 1e-8
++        self.inv_eps = 1.0 / self.eps
++        self.use_sb = True
++
++        self.state = torch.Generator(device=self.device)
++        if seed is not None:
++            self.state.manual_seed(seed)
++
++        if queue_event_options is None:
++            self.queue_event_options = torch.cat([
++                F.one_hot(torch.arange(0, self.q)),
++                -F.one_hot(torch.arange(0, self.q)),
++            ]).float().to(self.device)
++        else:
++            self.queue_event_options = queue_event_options.float().to(self.device)
++
++        self._draw_service = draw_service
++        self._draw_inter_arrivals = draw_inter_arrivals
++
++        self.reset()
++
++    def draw_service(self, time):
++        return self._draw_service(self, time)
++
++    def draw_inter_arrivals(self, time):
++        return self._draw_inter_arrivals(self, time)
++
++    def reset(self):
++        self.st_counts = torch.zeros(self.B, self.q, dtype=torch.int64, device=self.device)
++        self.st_data = torch.zeros(self.B, self.q, 1, device=self.device)
++        time = torch.zeros(self.B, 1, device=self.device)
++        self.arrival_times = self.draw_inter_arrivals(time)
++        self.queues = torch.zeros(self.B, self.q, device=self.device)
++        self.time = time
++        return self.queues.detach().cpu().numpy()
++
++    def step(self, actions):
++        if isinstance(actions, np.ndarray):
++            actions = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
++        if actions.dim() == 2 and actions.size(1) == self.s * self.q:
++            actions = actions.view(-1, self.s, self.q)
++        if actions.size(0) == 1 and self.B > 1:
++            actions = actions.expand(self.B, -1, -1)
++
++        actions = actions * self.network
++        actions = torch.minimum(actions, self.queues.unsqueeze(1).expand(-1, self.s, -1))
++
++        max_ub = max(int(self.st_counts.max().item()) + 1, 1)
++        allocated_work = torch.zeros(self.B, self.q, max_ub, device=self.device)
++        num_allocated = torch.zeros(self.B, self.q, dtype=torch.int64, device=self.device)
++        for b in range(self.B):
++            aw_b, na_b = allocator(actions[b:b+1], self.mu[b:b+1], self.st_counts[b])
++            nb = int(na_b.max().item())
++            if nb > 0:
++                allocated_work[b, :, :nb] = aw_b[:, :nb]
++            num_allocated[b] = na_b
++
++        max_n = int(num_allocated.max().item())
++        if max_n > 0:
++            st_slice = self.st_data[:, :, :max_n]
++            aw_slice = allocated_work[:, :, :max_n].clip(min=self.eps)
++            mask = torch.arange(max_n, device=self.device).view(1, 1, -1) < num_allocated.unsqueeze(-1)
++            ratio = st_slice / aw_slice
++            ratio[~mask] = float('inf')
++            min_eff = ratio.min(dim=-1).values
++            which_job = ratio.argmin(dim=-1)
++            min_eff_service_times = torch.where(
++                num_allocated > 0, min_eff,
++                torch.full((self.B, self.q), self.inv_eps, device=self.device),
++            )
++        else:
++            min_eff_service_times = torch.full((self.B, self.q), self.inv_eps, device=self.device)
++            which_job = torch.zeros(self.B, self.q, dtype=torch.int64, device=self.device)
++
++        event_times = torch.cat([self.arrival_times, min_eff_service_times], dim=1)
++        outcome = self.st_argmin(event_times)
++        delta_q = torch.matmul(outcome, self.queue_event_options)
++        event_time = event_times.min(dim=1).values
++
++        self.time = self.time + event_time.unsqueeze(-1)
++        cost = event_time * (self.queues @ self.h)
++        self.queues = F.relu(self.queues + delta_q)
++        if max_n > 0:
++            self.st_data[:, :, :max_n] -= event_time.view(-1, 1, 1) * allocated_work[:, :, :max_n]
++        self.arrival_times = self.arrival_times - event_time.unsqueeze(-1)
++
++        delta = delta_q.int()
++        has_arrival = (delta == 1).any(dim=1)
++        if has_arrival.any():
++            new_arrival = self.draw_inter_arrivals(self.time)
++            new_service = self.draw_service(self.time)
++            aq = outcome[:, :self.q].argmax(dim=1)
++            ba = torch.where(has_arrival)[0]
++            qa = aq[ba]
++            ca = self.st_counts[ba, qa]
++            need = (ca + 1).max().item()
++            if need > self.st_data.size(-1):
++                pad = torch.zeros(self.B, self.q, need - self.st_data.size(-1), device=self.device)
++                self.st_data = torch.cat([self.st_data, pad], dim=-1)
++            self.st_data[ba, qa, ca] = new_service[ba, qa]
++            self.st_counts[ba, qa] = ca + 1
++            self.arrival_times[ba, qa] = new_arrival[ba, qa]
++
++        has_departure = (delta == -1).any(dim=1)
++        if has_departure.any():
++            dq = outcome[:, self.q:].argmax(dim=1)
++            bd = torch.where(has_departure)[0]
++            qd = dq[bd]
++            jd = which_job[bd, qd]
++            cd = self.st_counts[bd, qd]
++            need_swap = jd < cd - 1
++            if need_swap.any():
++                self.st_data[bd[need_swap], qd[need_swap], jd[need_swap]] = \
++                    self.st_data[bd[need_swap], qd[need_swap], cd[need_swap] - 1]
++            self.st_counts[bd, qd] = cd - 1
++
++        done = np.zeros(self.B, dtype=bool)
++        reward = -cost.detach().cpu().numpy()
++        infos = [{} for _ in range(self.B)]
++        return self.queues.detach().cpu().numpy(), reward, done, infos

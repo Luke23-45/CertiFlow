@@ -40,6 +40,8 @@ from certiq_net.studies.qgym_eval.train.qgym_import import (
     load_rl_p_env,
 )
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from main.env import BatchedEnv
+from certiq_net.studies.qgym_eval.train.batched_vec_env import BatchedVecEnv
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -337,6 +339,8 @@ def main() -> None:
                         help="Override torch.set_num_threads (default: torch default). "
                              "For the DummyVecEnv path with tiny per-step ops, 1 often "
                              "beats the default (avoids thread oversubscription).")
+    parser.add_argument("--batched", action="store_true",
+                        help="Use BatchedEnv (Phase 2) instead of DummyVecEnv")
     args = parser.parse_args()
 
     if args.num_threads is not None:
@@ -500,7 +504,7 @@ def main() -> None:
     )
     print(f"  >> the old '410 ms/step' figure was a {200}x mislabel "
           f"(timed {200*200} steps, divided by 200). "
-          f"True per-step ≈ {t_env_old_label/200:.3f} ms — consistent with the "
+          f"True per-step ~= {t_env_old_label/200:.3f} ms -- consistent with the "
           f"steady-state {t_env_single:.3f} ms measurement above.")
 
     # ── 1b. DummyVecEnv vs SubprocVecEnv comparison ─────────────────────────
@@ -510,6 +514,58 @@ def main() -> None:
     # inconclusive for a ~1ms env, so we measure. This is read-only — it does
     # not change training behavior.
     _compare_vec_envs(env_cfg, env_temp, policy_name, env_device_t, actors, servicing_action)
+
+    # ── 1c. BatchedEnv (Phase 2) ─────────────────────────────────────────────
+    if args.batched:
+        print("\n--- BatchedEnv (Phase 2) ---")
+        from main.env import BatchedEnv
+        try:
+            # Build a BatchedEnv with the same config as the per-env dq
+            batched_seed = train_seed + 100000
+            benv = BatchedEnv(
+                network=network_t, mu=mu_t, h=torch.as_tensor(env_cfg["h"]),
+                draw_service=dq.draw_service_core, draw_inter_arrivals=dq.draw_inter_arrivals_core,
+                batch=actors, temp=env_temp, seed=batched_seed, device=env_device_t,
+                queue_event_options=dq.queue_event_options,
+            )
+            batch_action = np.broadcast_to(servicing_action, (actors,) + servicing_action.shape)
+
+            # Time single step
+            for _ in range(50):
+                benv.step(batch_action)
+            torch.cuda.synchronize() if str(env_device_t) == "cuda" else None
+            t0 = _time.perf_counter()
+            for _ in range(200):
+                benv.step(batch_action)
+            torch.cuda.synchronize() if str(env_device_t) == "cuda" else None
+            bt = (_time.perf_counter() - t0) * 1000 / 200
+            per_env = bt / actors * 1000
+            print(f"  [BatchedEnv.step (B={actors})] avg {bt:.3f} ms/call "
+                  f"({bt/actors:.3f} ms/env-step)")
+
+            # Time BatchedVecEnv wrapper
+            bvec = BatchedVecEnv(benv)
+            for _ in range(20):
+                bvec.step(batch_action)
+            torch.cuda.synchronize() if str(env_device_t) == "cuda" else None
+            t0 = _time.perf_counter()
+            for _ in range(200):
+                bvec.step(batch_action)
+            torch.cuda.synchronize() if str(env_device_t) == "cuda" else None
+            bvt = (_time.perf_counter() - t0) * 1000 / 200
+            print(f"  [BatchedVecEnv.step (B={actors})] avg {bvt:.3f} ms/timestep "
+                  f"({bvt/actors:.3f} ms/env-step)")
+
+            # Compare to DummyVecEnv
+            print(f"  >> BatchedVecEnv vs DummyVecEnv: "
+                  f"{'FASTER' if bvt < 66.29 else 'SLOWER'}"
+                  f" ({bvt:.1f} vs ~66.3 ms/timestep on last run)")
+
+            benv = bvec = None  # allow GC
+        except Exception as e:
+            import traceback
+            print(f"  [BatchedEnv] FAILED: {type(e).__name__}: {e}")
+            traceback.print_exc()
 
     # ── 2. Policy forward (single) ──────────────────────────────────────────
     print("\n--- CertiQ Policy Forward ---")

@@ -112,6 +112,11 @@ def main() -> None:
              "DummyVecEnv path with tiny per-step ops, 1 often beats the default "
              "because it avoids thread oversubscription across the serial env loop.",
     )
+    parser.add_argument(
+        "--batched",
+        action="store_true",
+        help="Use BatchedEnv (Phase 2) instead of DummyVecEnv/SubprocVecEnv",
+    )
     args = parser.parse_args()
 
     if args.num_threads is not None:
@@ -195,12 +200,28 @@ def main() -> None:
         device=torch.device(env_device),
     )
 
-    env_fns = [lambda s=seed: make_env(s) for seed in range(train_seed, train_seed + actors)]
-    if args.parallel:
-        start_method = "spawn" if sys.platform == "win32" else "fork"
-        dq = SubprocVecEnv(env_fns, start_method=start_method)
+    if args.batched:
+        from main.env import BatchedEnv
+        from certiq_net.studies.qgym_eval.train.batched_vec_env import BatchedVecEnv
+
+        h_t = torch.as_tensor(env_cfg["h"])
+        benv = BatchedEnv(
+            network=network_t, mu=mu_t, h=h_t,
+            draw_service=dq_raw.draw_service_core,
+            draw_inter_arrivals=dq_raw.draw_inter_arrivals_core,
+            batch=actors, temp=env_temp, seed=train_seed,
+            device=torch.device(env_device),
+            queue_event_options=dq_raw.queue_event_options,
+        )
+        dq = BatchedVecEnv(benv)
+        print(f"[train] Using BatchedVecEnv with B={actors}")
     else:
-        dq = DummyVecEnv(env_fns)
+        env_fns = [lambda s=seed: make_env(s) for seed in range(train_seed, train_seed + actors)]
+        if args.parallel:
+            start_method = "spawn" if sys.platform == "win32" else "fork"
+            dq = SubprocVecEnv(env_fns, start_method=start_method)
+        else:
+            dq = DummyVecEnv(env_fns)
 
     dq_test_list = [make_test_env(seed) for seed in range(test_seed, test_seed + 100)]
 

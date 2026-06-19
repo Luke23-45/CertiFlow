@@ -129,12 +129,10 @@ def _is_patched() -> bool:
         return False
     try:
         text = env_py.read_text()
-        # After patch 0009 the allocator signature changed from
-        #   allocator(action, mu, queue_service_times)
-        # to
-        #   allocator(action, mu, queue_counts)
-        # and the body uses torch, not numpy.  Check for the new signature.
-        return "def allocator(action, mu, queue_counts):" in text
+        # After patch 0009 the allocator signature changed.
+        # After patch 0011 BatchedEnv was added.
+        return ("def allocator(action, mu, queue_counts):" in text and
+                "class BatchedEnv:" in text)
     except OSError:
         return False
 
