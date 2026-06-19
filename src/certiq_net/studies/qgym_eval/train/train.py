@@ -67,11 +67,19 @@ from certiq_net.studies.qgym_eval.train.qgym_import import (
 _project_root = Path(certiq_net.__file__).resolve().parents[2]
 _QGYM_ROOT = _project_root / "extern" / "QGym"
 _RL_ROOT = _QGYM_ROOT / "RL"
+_OUR_CONFIG_ROOT = _project_root / "src" / "certiq_net" / "studies" / "qgym_eval" / "configs"
 
 
 def _load_yaml(path: Path) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _load_policy_config(name: str) -> dict:
+    our_path = _OUR_CONFIG_ROOT / "policy" / f"{name}.yaml"
+    if our_path.exists():
+        return _load_yaml(our_path)
+    return _load_yaml(_RL_ROOT / "policy_configs" / f"{name}.yaml")
 
 
 def main() -> None:
@@ -129,7 +137,7 @@ def main() -> None:
         print(f"[train] torch.set_num_threads({args.num_threads})")
 
     # ── Load configs ────────────────────────────────────────────────────────
-    policy_cfg = _load_yaml(_RL_ROOT / "policy_configs" / f"{args.policy_config}.yaml")
+    policy_cfg = _load_policy_config(args.policy_config)
     if args.device is not None:
         policy_cfg["env"]["device"] = args.device
     env_cfg = _load_yaml(_QGYM_ROOT / "configs" / "env" / f"{args.env_config}.yaml")
