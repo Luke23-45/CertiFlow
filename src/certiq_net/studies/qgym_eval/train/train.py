@@ -121,6 +121,11 @@ def main() -> None:
              "because it avoids thread oversubscription across the serial env loop.",
     )
     parser.add_argument(
+        "--eval-freq", type=int, default=None,
+        help="Override eval frequency in timesteps (default: episode_steps * actors). "
+             "Increase this to reduce evaluation overhead during training.",
+    )
+    parser.add_argument(
         "--batched",
         action="store_true",
         help="Use BatchedEnv (Phase 2) instead of DummyVecEnv/SubprocVecEnv",
@@ -192,7 +197,9 @@ def main() -> None:
 
     batched_b = actors
     total_steps = num_epochs * episode_steps * actors
-    eval_freq = episode_steps
+    eval_freq = episode_steps * actors
+    if args.eval_freq is not None:
+        eval_freq = args.eval_freq
     test_T = env_cfg.get("test_T", 10000)
 
     # ── Create environments ────────────────────────────────────────────────
@@ -313,7 +320,7 @@ def main() -> None:
         tensorboard_log=None,
         policy_kwargs=policy_kwargs,
         verbose=1,
-        seed=None,
+        seed=train_seed,
         device=device,
         _init_setup_model=True,
     )

@@ -135,6 +135,10 @@ class CertiqPPOTrainer(CustomPPOTrainer):
                 )
                 self.optimizer_policy.step()
 
+                # Reset gradients after policy phase so the shared encoder
+                # does not accumulate policy-phase gradients into the value phase.
+                self.policy.zero_grad()
+
             # Value phase (unchanged from parent)
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 values = self.policy.evaluate_values(
