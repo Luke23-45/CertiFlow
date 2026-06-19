@@ -117,6 +117,11 @@ def main() -> None:
         action="store_true",
         help="Use BatchedEnv (Phase 2) instead of DummyVecEnv/SubprocVecEnv",
     )
+    parser.add_argument(
+        "--batched-actors", type=int, default=None,
+        help="Override number of actors for BatchedEnv (default: from config). "
+             "GPU benefits from larger batches (1000+). Does NOT affect total_steps.",
+    )
     args = parser.parse_args()
 
     if args.num_threads is not None:
@@ -170,6 +175,18 @@ def main() -> None:
     eval_freq = episode_steps
     test_T = env_cfg.get("test_T", 10000)
 
+    # Auto-enable --batched on CUDA (unless --parallel explicitly requested)
+    if str(device) == "cuda" and not args.parallel:
+        if not args.batched:
+            args.batched = True
+            print("[train] Auto-enabled --batched for CUDA device")
+    # Apply --batched-actors override when batched mode is active
+    if args.batched and args.batched_actors is not None:
+        batched_b = args.batched_actors
+        print(f"[train] BatchedEnv using B={batched_b} (--batched-actors)")
+    else:
+        batched_b = actors
+
     # ── Create environments ────────────────────────────────────────────────
     def make_env(seed):
         return load_rl_p_env(
@@ -209,12 +226,12 @@ def main() -> None:
             network=network_t, mu=mu_t, h=h_t,
             draw_service=dq_raw.draw_service_core,
             draw_inter_arrivals=dq_raw.draw_inter_arrivals_core,
-            batch=actors, temp=env_temp, seed=train_seed,
+            batch=batched_b, temp=env_temp, seed=train_seed,
             device=torch.device(env_device),
             queue_event_options=dq_raw.queue_event_options,
         )
         dq = BatchedVecEnv(benv)
-        print(f"[train] Using BatchedVecEnv with B={actors}")
+        print(f"[train] Using BatchedVecEnv with B={batched_b}")
     else:
         env_fns = [lambda s=seed: make_env(s) for seed in range(train_seed, train_seed + actors)]
         if args.parallel:

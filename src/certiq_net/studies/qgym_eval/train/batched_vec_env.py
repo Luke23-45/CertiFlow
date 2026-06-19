@@ -11,12 +11,16 @@ class BatchedVecEnv(VecEnv):
 
     def __init__(self, env):
         self.env = env
+        import gymnasium.spaces
         obs_space = type("Box", (), {"shape": (env.q,), "dtype": np.float32, "low": 0, "high": np.inf})()
         act_space = type("Box", (), {"shape": (env.s, env.q), "dtype": np.float32, "low": 0, "high": 1})()
-        import gymnasium.spaces
         obs_space = gymnasium.spaces.Box(low=0, high=np.inf, shape=(env.q,), dtype=np.float32)
         act_space = gymnasium.spaces.Box(low=0, high=1, shape=(env.s, env.q), dtype=np.float32)
         super().__init__(env.B, obs_space, act_space)
+
+    @property
+    def device(self):
+        return self.env.device
 
     def step_async(self, actions):
         self._actions = actions

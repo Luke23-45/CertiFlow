@@ -231,7 +231,7 @@ def _run_training_step(policy, obs_tensor, action_tensor) -> None:
 
 # ── VecEnv comparison ────────────────────────────────────────────────────────
 
-def _compare_vec_envs(env_cfg, env_temp, policy_name, env_device_t, actors, action) -> None:
+def _compare_vec_envs(env_cfg, env_temp, policy_name, env_device_t, actors, action) -> tuple[float | None, float | None]:
     """Time DummyVecEnv vs SubprocVecEnv stepping `actors` envs in tandem.
 
     Answers: does process-level parallelism beat the serial DummyVecEnv loop for
@@ -325,6 +325,8 @@ def _compare_vec_envs(env_cfg, env_temp, policy_name, env_device_t, actors, acti
     elif t_dummy is not None:
         print("  >> SubprocVecEnv unavailable on this platform; only DummyVecEnv measured.")
 
+    return t_dummy, t_subproc
+
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -341,6 +343,11 @@ def main() -> None:
                              "beats the default (avoids thread oversubscription).")
     parser.add_argument("--batched", action="store_true",
                         help="Use BatchedEnv (Phase 2) instead of DummyVecEnv")
+    parser.add_argument("--test-batches", type=str, default=None,
+                        help="Comma-separated batch sizes for BatchedEnv scaling curve "
+                             "(e.g. '50,100,500,1000,5000')")
+    parser.add_argument("--bench", action="store_true",
+                        help="Compact benchmark mode: skip policy/training, print JSON summary")
     args = parser.parse_args()
 
     if args.num_threads is not None:
@@ -513,12 +520,24 @@ def main() -> None:
     # wisdom (SubprocVecEnv for heavy envs, DummyVecEnv for light ones) is
     # inconclusive for a ~1ms env, so we measure. This is read-only — it does
     # not change training behavior.
-    _compare_vec_envs(env_cfg, env_temp, policy_name, env_device_t, actors, servicing_action)
+    t_dummy, t_subproc = _compare_vec_envs(
+        env_cfg, env_temp, policy_name, env_device_t, actors, servicing_action
+    )
+
+    # Default values for --bench mode (overwritten if BatchedEnv section runs)
+    bvt = None
+    bench_scaling = {}
+    best_b = None
 
     # ── 1c. BatchedEnv (Phase 2) ─────────────────────────────────────────────
-    if args.batched:
+    _run_batched = args.batched or device_str == "cuda"
+    if _run_batched:
         print("\n--- BatchedEnv (Phase 2) ---")
         from main.env import BatchedEnv
+        from certiq_net.studies.qgym_eval.train.batched_vec_env import BatchedVecEnv
+
+        if device_str == "cuda" and not args.batched:
+            print("  [auto-enabled for CUDA device, use --no-batched to disable]")
         try:
             # Build a BatchedEnv with the same config as the per-env dq
             batched_seed = train_seed + 100000
@@ -556,17 +575,81 @@ def main() -> None:
             print(f"  [BatchedVecEnv.step (B={actors})] avg {bvt:.3f} ms/timestep "
                   f"({bvt/actors:.3f} ms/env-step)")
 
-            # Compare to DummyVecEnv
-            print(f"  >> BatchedVecEnv vs DummyVecEnv: "
-                  f"{'FASTER' if bvt < 66.29 else 'SLOWER'}"
-                  f" ({bvt:.1f} vs ~66.3 ms/timestep on last run)")
+            # Compare to DummyVecEnv using dynamic t_dummy (measured above)
+            if t_dummy is not None:
+                ratio = t_dummy / bvt if bvt > 0 else float('inf')
+                print(f"  >> BatchedVecEnv is {ratio:.2f}x {'faster' if ratio > 1 else 'slower'}"
+                      f" than DummyVecEnv ({bvt:.1f} vs {t_dummy:.1f} ms/timestep)")
+            else:
+                print(f"  >> BatchedVecEnv: {bvt:.1f} ms/timestep (no DummyVecEnv baseline)")
 
-            step_per_timestep = bvt  # use BatchedVecEnv timing for the bottleneck estimate
+            step_per_timestep = bvt  # use BatchedVecEnv timing for bottleneck estimate
             benv = bvec = None  # allow GC
         except Exception as e:
             import traceback
             print(f"  [BatchedEnv] FAILED: {type(e).__name__}: {e}")
             traceback.print_exc()
+
+    # ── 1d. BatchedEnv scaling curve (--test-batches) ────────────────────────
+    if args.test_batches and _run_batched:
+        batch_sizes = [int(x.strip()) for x in args.test_batches.split(",")]
+        print("\n--- BatchedEnv Scaling ---")
+        print(f"  {'B':>6s}  {'ms/call':>10s}  {'us/env-step':>12s}  {'env-steps/s':>12s}")
+        print(f"  {'-'*44}")
+        from main.env import BatchedEnv
+
+        results = {}
+        for b in batch_sizes:
+            try:
+                benv_b = BatchedEnv(
+                    network=network_t, mu=mu_t, h=torch.as_tensor(env_cfg["h"]),
+                    draw_service=dq.draw_service_core,
+                    draw_inter_arrivals=dq.draw_inter_arrivals_core,
+                    batch=b, temp=env_temp, seed=batched_seed, device=env_device_t,
+                    queue_event_options=dq.queue_event_options,
+                )
+                act_b = np.broadcast_to(servicing_action, (b,) + servicing_action.shape)
+                for _ in range(50):
+                    benv_b.step(act_b)
+                torch.cuda.synchronize() if str(env_device_t) == "cuda" else None
+                t0 = _time.perf_counter()
+                for _ in range(200):
+                    benv_b.step(act_b)
+                torch.cuda.synchronize() if str(env_device_t) == "cuda" else None
+                ms = (_time.perf_counter() - t0) * 1000 / 200
+                us_per = ms / b * 1000
+                throughput = b / ms * 1000
+                results[b] = ms
+                print(f"  {b:>6d}  {ms:>10.2f}  {us_per:>12.2f}  {throughput:>12.0f}")
+            except Exception as e:
+                print(f"  {b:>6d}  FAILED — {e}")
+
+        if results:
+            best_b = max(results, key=lambda k: k / results[k] * 1000)
+            print(f"\n  >> Optimal batch size: B={best_b} "
+                  f"({best_b/results[best_b]*1000:.0f} env-steps/s)")
+            bench_scaling = results
+        else:
+            bench_scaling = {}
+
+    if args.bench:
+        # Compact JSON summary for --bench mode
+        import json as _json
+        bench = {
+            "dummy_ms": t_dummy if t_dummy is not None else None,
+            "batched_ms": bvt if bvt is not None else None,
+            "actors": actors,
+            "device": device_str,
+            "env": env_type,
+        }
+        if t_dummy is not None and bvt is not None and bvt > 0:
+            bench["speedup"] = round(t_dummy / bvt, 2)
+        if args.test_batches and bench_scaling:
+            bench["scaling"] = {str(k): round(v, 2) for k, v in bench_scaling.items()}
+            if best_b is not None:
+                bench["optimal_b"] = best_b
+        print(f"\nBENCH {_json.dumps(bench)}")
+        return
 
     # ── 2. Policy forward (single) ──────────────────────────────────────────
     print("\n--- CertiQ Policy Forward ---")
