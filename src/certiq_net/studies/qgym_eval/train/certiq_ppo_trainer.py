@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch as th
@@ -40,7 +41,7 @@ class CertiqPPOTrainer(CustomPPOTrainer):
             )
 
         self.policy.set_training_mode(True)
-        training_time_start = th.time()
+        training_time_start = time.time()
         self.training_iteration += 1
 
         self._update_learning_rate(self.optimizer_policy, self.optimizer_value)
@@ -169,7 +170,7 @@ class CertiqPPOTrainer(CustomPPOTrainer):
         avg_excess = th.tensor(excess_means).mean().item()
         self._nu_val = max(0.0, self._nu_val + self.lr_nu * avg_excess)
 
-        training_time_end = th.time()
+        training_time_end = time.time()
         print(f"training_time: {training_time_end - training_time_start}")
 
         self.logger.record(
