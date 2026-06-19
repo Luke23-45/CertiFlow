@@ -248,7 +248,8 @@ def main() -> None:
         else:
             dq = DummyVecEnv(env_fns)
 
-    dq_test_list = [make_test_env(seed) for seed in range(test_seed, test_seed + 100)]
+    num_test_envs = policy_cfg["training"].get("test_batch", 100)
+    dq_test_list = [make_test_env(seed) for seed in range(test_seed, test_seed + num_test_envs)]
 
     # ── Policy kwargs ──────────────────────────────────────────────────────
     scale = policy_cfg["model"]["scale"]
