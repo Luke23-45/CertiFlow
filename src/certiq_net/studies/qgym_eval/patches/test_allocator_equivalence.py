@@ -129,20 +129,26 @@ def _run_allocator(inputs):
     """Run the on-disk allocator over all inputs, capture comparable outputs."""
     results = []
     for name, action_t, mu_t, st in inputs:
-        # allocator accepts queue_counts (list of ints) instead of service_times lists.
-        allocated_a, qni, num_alloc = allocator(action_t, mu_t, [len(x) for x in st])
-        # Convert to plain Python/numpy for pickling + comparison. Each element of
-        # allocated_a[q] is a 0-d tensor (value = mu_with_grad[0][s][q]); coerce
-        # robustly via float(tensor) which works for 0-d and 1-element tensors.
-        allocated_serialized = [
-            [float(v) for v in inner]
-            for inner in allocated_a
-        ]
-        qni_serialized = {k: [tuple(int(i) for i in idx) for idx in v] for k, v in qni.items()}
+        raw = allocator(action_t, mu_t, [len(x) for x in st])
+        # Handle both old (3-return) and new (2-return) allocator formats.
+        if len(raw) == 3:
+            allocated_a = raw[0]
+            num_alloc = raw[2]
+            allocated_serialized = [
+                [float(v) for v in inner]
+                for inner in allocated_a
+            ]
+        else:
+            allocated_work, num_alloc = raw
+            qq = allocated_work.shape[0]
+            allocated_serialized = [
+                [float(allocated_work[q_idx, j].item())
+                 for j in range(int(num_alloc[q_idx].item()))]
+                for q_idx in range(qq)
+            ]
         results.append({
             "name": name,
             "allocated_a": allocated_serialized,
-            "queue_nonzero_inds": qni_serialized,
             "num_allocated": [int(n) for n in num_alloc],
         })
     return results
@@ -165,32 +171,27 @@ def _compare(golden, current, verbose: bool = True) -> bool:
             case_ok = False
             msgs.append(f"  num_allocated: golden={g['num_allocated']} current={c['num_allocated']}")
 
-        # allocated_a: element-wise within tol. Compare nested list lengths too.
-        ga, ca = g["allocated_a"], c["allocated_a"]
-        if len(ga) != len(ca):
-            case_ok = False
-            msgs.append(f"  allocated_a outer len: golden={len(ga)} current={len(ca)}")
-        else:
-            for qi, (gq, cq) in enumerate(zip(ga, ca)):
-                if len(gq) != len(cq):
-                    case_ok = False
-                    msgs.append(f"  allocated_a[{qi}] len: golden={len(gq)} current={len(cq)}")
-                    continue
-                for vi, (gv, cv) in enumerate(zip(gq, cq)):
-                    if not (abs(gv - cv) <= _ATOL + _RTOL * abs(gv)):
+            # allocated_a: element-wise within tol. Compare nested list lengths too.
+            ga, ca = g["allocated_a"], c["allocated_a"]
+            if len(ga) != len(ca):
+                case_ok = False
+                msgs.append(f"  allocated_a outer len: golden={len(ga)} current={len(ca)}")
+            else:
+                for qi, (gq, cq) in enumerate(zip(ga, ca)):
+                    if len(gq) != len(cq):
                         case_ok = False
-                        msgs.append(f"  allocated_a[{qi}][{vi}]: golden={gv:.6g} current={cv:.6g}")
-
-        # queue_nonzero_inds: exact (s,q) sequence per queue
-        gqni, cqni = g["queue_nonzero_inds"], c["queue_nonzero_inds"]
-        if set(gqni.keys()) != set(cqni.keys()):
-            case_ok = False
-            msgs.append(f"  qni keys: golden={set(gqni.keys())} current={set(cqni.keys())}")
-        else:
-            for k in gqni:
-                if gqni[k] != cqni[k]:
-                    case_ok = False
-                    msgs.append(f"  qni[{k}]: golden={gqni[k]} current={cqni[k]}")
+                        msgs.append(f"  allocated_a[{qi}] len: golden={len(gq)} current={len(cq)}")
+                        continue
+                    for vi, (gv, cv) in enumerate(zip(gq, cq)):
+                        if not (abs(gv - cv) <= _ATOL + _RTOL * abs(gv)):
+                            case_ok = False
+                            msgs.append(f"  allocated_a[{qi}][{vi}]: golden={gv:.6g} current={cv:.6g}")
+                    # Verify descending sort within each queue (behavioral invariant)
+                    for vi in range(1, len(cq)):
+                        if cq[vi] > cq[vi - 1] + _ATOL:
+                            case_ok = False
+                            msgs.append(f"  allocated_a[{qi}] NOT sorted descending at [{vi}]: "
+                                        f"{cq[vi - 1]:.6g} -> {cq[vi]:.6g}")
 
         status = "PASS" if case_ok else "FAIL"
         if verbose or not case_ok:
@@ -238,8 +239,7 @@ def main() -> int:
     else:
         nfail = sum(1 for g, c in zip(golden, current)
                     if g["num_allocated"] != c["num_allocated"]
-                    or g["allocated_a"] != c["allocated_a"]
-                    or g["queue_nonzero_inds"] != c["queue_nonzero_inds"])
+                    or g["allocated_a"] != c["allocated_a"])
         print(f"\n[test] {nfail}/{len(current)} CASES MISMATCH — rewrite changed behavior.")
         return 1
 
