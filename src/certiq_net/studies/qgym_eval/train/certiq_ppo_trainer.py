@@ -113,7 +113,7 @@ class CertiqPPOTrainer(CustomPPOTrainer):
                     log_ratio = log_prob - rollout_data.old_log_prob
                     approx_kl_div = th.mean(
                         (th.exp(log_ratio) - 1) - log_ratio
-                    ).cpu().numpy()
+                    ).cpu().item()
                     approx_kl_divs.append(approx_kl_div)
 
                 if (
