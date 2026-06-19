@@ -120,7 +120,7 @@ def main() -> None:
     parser.add_argument(
         "--batched-actors", type=int, default=None,
         help="Override number of actors for BatchedEnv (default: from config). "
-             "GPU benefits from larger batches (1000+). Does NOT affect total_steps.",
+             "GPU benefits from larger batches (1000+). Also updates total_steps.",
     )
     args = parser.parse_args()
 
@@ -171,21 +171,21 @@ def main() -> None:
     actors = args.num_actors if args.num_actors is not None else policy_cfg["training"]["actors"]
     num_epochs = policy_cfg["training"]["num_epochs"]
     episode_steps = policy_cfg["training"]["episode_steps"]
-    total_steps = num_epochs * episode_steps * actors
-    eval_freq = episode_steps
-    test_T = env_cfg.get("test_T", 10000)
-
     # Auto-enable --batched on CUDA (unless --parallel explicitly requested)
     if str(device) == "cuda" and not args.parallel:
         if not args.batched:
             args.batched = True
             print("[train] Auto-enabled --batched for CUDA device")
-    # Apply --batched-actors override when batched mode is active
+    # Apply --batched-actors override BEFORE total_steps so everything downstream
+    # (total_steps, trainer_kwargs["actors"], etc.) uses the correct count.
     if args.batched and args.batched_actors is not None:
-        batched_b = args.batched_actors
-        print(f"[train] BatchedEnv using B={batched_b} (--batched-actors)")
-    else:
-        batched_b = actors
+        actors = args.batched_actors
+        print(f"[train] BatchedEnv using B={actors} (--batched-actors)")
+
+    batched_b = actors
+    total_steps = num_epochs * episode_steps * actors
+    eval_freq = episode_steps
+    test_T = env_cfg.get("test_T", 10000)
 
     # ── Create environments ────────────────────────────────────────────────
     def make_env(seed):
