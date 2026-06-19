@@ -27,6 +27,13 @@ from torch import nn
 
 import certiq_net
 from certiq_net.studies.qgym_eval.patches.apply_patches import ensure_patches_applied
+
+# Apply QGym submodule patches BEFORE any import that triggers QGym module
+# loading.  Python caches imported modules in sys.modules; if we patch the
+# files on disk after the module is already loaded, the in-memory copy still
+# has the old (unpatched) code.
+ensure_patches_applied()
+
 from certiq_net.studies.qgym_eval.train.certiq_sb3_policy import CertiQSB3Policy
 
 from certiq_net.studies.qgym_eval.train.qgym_import import (
@@ -315,8 +322,6 @@ def _compare_vec_envs(env_cfg, env_temp, policy_name, env_device_t, actors, acti
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    ensure_patches_applied()
-
     import argparse
     parser = argparse.ArgumentParser(description="Profile bottleneck")
     parser.add_argument("policy_config", type=str)

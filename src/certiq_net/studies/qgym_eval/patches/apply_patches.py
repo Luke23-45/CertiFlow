@@ -122,9 +122,28 @@ def apply_all_patches(force: bool = False) -> None:
         print("[patches] Some patches failed — see warnings above.", file=sys.stderr)
 
 
+def _is_patched() -> bool:
+    """Return True if the QGym env.py contains a known patched signature."""
+    env_py = _QGYM_ROOT / "main" / "env.py"
+    if not env_py.exists():
+        return False
+    try:
+        text = env_py.read_text()
+        # After patch 0009 the allocator signature changed from
+        #   allocator(action, mu, queue_service_times)
+        # to
+        #   allocator(action, mu, queue_counts)
+        # and the body uses torch, not numpy.  Check for the new signature.
+        return "def allocator(action, mu, queue_counts):" in text
+    except OSError:
+        return False
+
+
 def ensure_patches_applied() -> None:
     """Idempotent entry point — apply patches only if not already applied."""
-    apply_all_patches(force=False)
+    if _SENTINEL.exists() and _is_patched():
+        return
+    apply_all_patches(force=True)
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────

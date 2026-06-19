@@ -47,6 +47,13 @@ from torch import nn
 
 import certiq_net
 from certiq_net.studies.qgym_eval.patches.apply_patches import ensure_patches_applied
+
+# Apply QGym submodule patches BEFORE any import that triggers QGym module
+# loading.  Python caches imported modules in sys.modules; if we patch the
+# files on disk after the module is already loaded, the in-memory copy still
+# has the old (unpatched) code.
+ensure_patches_applied()
+
 from certiq_net.studies.qgym_eval.train.certiq_sb3_policy import CertiQSB3Policy
 from stable_baselines3.common.env_util import DummyVecEnv, SubprocVecEnv
 
@@ -68,8 +75,6 @@ def _load_yaml(path: Path) -> dict:
 
 
 def main() -> None:
-    # Apply QGym submodule patches (tensor fixes, etc.) before any QGym imports
-    ensure_patches_applied()
 
     parser = argparse.ArgumentParser(
         description="Train CertiQ using QGym's PPO pipeline"
