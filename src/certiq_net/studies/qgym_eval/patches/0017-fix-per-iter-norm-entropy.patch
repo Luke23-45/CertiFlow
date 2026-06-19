@@ -1,0 +1,22 @@
+diff --git a/RL/policy_configs/vanilla.yaml b/RL/policy_configs/vanilla.yaml
+index eb4b4c2..a9aee41 100644
+--- a/RL/policy_configs/vanilla.yaml
++++ b/RL/policy_configs/vanilla.yaml
+@@ -22,7 +22,7 @@ training:
+   amp_value: False
+   var_scaler: 1.0
+   per_iter_normal_obs: False
+-  per_iter_normal_value: False
++  per_iter_normal_value: True
+   actors: 50
+   episode_steps: 10000
+   num_epochs: 100 
+@@ -40,7 +40,7 @@ training:
+   batch_size: 5000 
+   ppo_epochs: 3 
+   clip_range_vf: null 
+-  ent_coef: 0.0  
++  ent_coef: 0.01  
+ policy: 
+   test_policy: 'vanilla' 
+ plot: 
