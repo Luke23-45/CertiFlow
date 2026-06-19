@@ -296,13 +296,18 @@ def _compare_vec_envs(env_cfg, env_temp, policy_name, env_device_t, actors, acti
     )
 
     # Subproc: one process per env. spawn on win32 (matches train.py), fork elsewhere.
-    start_method = "spawn" if _sys.platform == "win32" else "fork"
-    proc_fns = [(lambda s=seed: _make_env(s)) for seed in range(3003, 3003 + actors)]
-    t_subproc = _time_backend(
-        f"SubprocVecEnv (x{actors}, {start_method})",
-        lambda: SubprocVecEnv(proc_fns, start_method=start_method),
-        rollout_steps,
-    )
+    # CUDA cannot be shared across forked processes, so skip when the env is on CUDA.
+    if str(env_device_t) == "cuda":
+        print(f"\n  [SubprocVecEnv] SKIPPED — CUDA cannot be forked.")
+        t_subproc = None
+    else:
+        start_method = "spawn" if _sys.platform == "win32" else "fork"
+        proc_fns = [(lambda s=seed: _make_env(s)) for seed in range(3003, 3003 + actors)]
+        t_subproc = _time_backend(
+            f"SubprocVecEnv (x{actors}, {start_method})",
+            lambda: SubprocVecEnv(proc_fns, start_method=start_method),
+            rollout_steps,
+        )
 
     if t_dummy is not None and t_subproc is not None:
         if t_subproc < t_dummy:
@@ -346,7 +351,7 @@ def main() -> None:
     env_cfg = _load_yaml(_QGYM_ROOT / "configs" / "env" / f"{args.env_config}.yaml")
     env_type = env_cfg.get("env_type", env_cfg["name"])
     device_str = policy_cfg["env"]["device"]
-    env_device = device_str
+    env_device = "cpu" if device_str == "cuda" else device_str
     device = torch.device(device_str)
     env_device_t = torch.device(env_device)
 
