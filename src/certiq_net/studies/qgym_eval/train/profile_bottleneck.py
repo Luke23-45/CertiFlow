@@ -706,7 +706,10 @@ def main() -> None:
     # rollout is many consecutive steps with no reset. t_env_single (steady-state)
     # is a lower bound; the truth is between them.
     fwd_per_timestep = t_forward_actors  # ms for 1 policy forward over `actors` obs
-    step_per_timestep = t_env_horizon * actors  # ms for stepping all `actors` envs
+    if _run_batched and bvt is not None:
+        step_per_timestep = bvt  # measured BatchedVecEnv timing
+    else:
+        step_per_timestep = t_env_horizon * actors  # per-env × actors
     collect_per_timestep = fwd_per_timestep + step_per_timestep
     collect_total = collect_per_timestep * episode_steps / 1000  # seconds
 
