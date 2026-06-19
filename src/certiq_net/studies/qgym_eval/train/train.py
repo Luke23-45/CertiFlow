@@ -126,6 +126,11 @@ def main() -> None:
              "Increase this to reduce evaluation overhead during training.",
     )
     parser.add_argument(
+        "--test-batch", type=int, default=None,
+        help="Override number of test envs for evaluation (default: from config, e.g. 100). "
+             "Reduce to lower eval memory (e.g. 20), increase for more precise metrics.",
+    )
+    parser.add_argument(
         "--batched",
         action="store_true",
         help="Use BatchedEnv (Phase 2) instead of DummyVecEnv/SubprocVecEnv",
@@ -200,6 +205,9 @@ def main() -> None:
     eval_freq = episode_steps * actors
     if args.eval_freq is not None:
         eval_freq = args.eval_freq
+    if args.test_batch is not None:
+        policy_cfg["training"]["test_batch"] = args.test_batch
+        print(f"[train] test_batch = {args.test_batch} (--test-batch override)")
     test_T = env_cfg.get("test_T", 10000)
 
     # ── Create environments ────────────────────────────────────────────────
