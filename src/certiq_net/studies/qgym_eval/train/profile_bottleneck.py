@@ -528,15 +528,15 @@ def main() -> None:
                 batch=actors, temp=env_temp, seed=batched_seed, device=env_device_t,
                 queue_event_options=dq.queue_event_options,
             )
-            batch_action = np.broadcast_to(servicing_action, (actors,) + servicing_action.shape)
+            benv_action = np.broadcast_to(servicing_action, (actors,) + servicing_action.shape)
 
             # Time single step
             for _ in range(50):
-                benv.step(batch_action)
+                benv.step(benv_action)
             torch.cuda.synchronize() if str(env_device_t) == "cuda" else None
             t0 = _time.perf_counter()
             for _ in range(200):
-                benv.step(batch_action)
+                benv.step(benv_action)
             torch.cuda.synchronize() if str(env_device_t) == "cuda" else None
             bt = (_time.perf_counter() - t0) * 1000 / 200
             per_env = bt / actors * 1000
@@ -546,11 +546,11 @@ def main() -> None:
             # Time BatchedVecEnv wrapper
             bvec = BatchedVecEnv(benv)
             for _ in range(20):
-                bvec.step(batch_action)
+                bvec.step(benv_action)
             torch.cuda.synchronize() if str(env_device_t) == "cuda" else None
             t0 = _time.perf_counter()
             for _ in range(200):
-                bvec.step(batch_action)
+                bvec.step(benv_action)
             torch.cuda.synchronize() if str(env_device_t) == "cuda" else None
             bvt = (_time.perf_counter() - t0) * 1000 / 200
             print(f"  [BatchedVecEnv.step (B={actors})] avg {bvt:.3f} ms/timestep "
@@ -561,6 +561,7 @@ def main() -> None:
                   f"{'FASTER' if bvt < 66.29 else 'SLOWER'}"
                   f" ({bvt:.1f} vs ~66.3 ms/timestep on last run)")
 
+            step_per_timestep = bvt  # use BatchedVecEnv timing for the bottleneck estimate
             benv = bvec = None  # allow GC
         except Exception as e:
             import traceback
