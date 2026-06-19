@@ -145,7 +145,7 @@ def main() -> None:
 
     # ── Training hyperparams ───────────────────────────────────────────────
     device = policy_cfg["env"]["device"]
-    env_device = "cpu" if device == "cuda" else device
+    env_device = device
     test_seed = policy_cfg["env"]["test_seed"]
     train_seed = policy_cfg["env"]["train_seed"]
     env_temp = policy_cfg["env"]["env_temp"]

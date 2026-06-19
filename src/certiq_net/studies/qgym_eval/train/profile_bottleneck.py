@@ -341,7 +341,7 @@ def main() -> None:
     env_cfg = _load_yaml(_QGYM_ROOT / "configs" / "env" / f"{args.env_config}.yaml")
     env_type = env_cfg.get("env_type", env_cfg["name"])
     device_str = policy_cfg["env"]["device"]
-    env_device = "cpu" if device_str == "cuda" else device_str
+    env_device = device_str
     device = torch.device(device_str)
     env_device_t = torch.device(env_device)
 

@@ -1,0 +1,92 @@
+diff --git a/RL/utils/rl_env.py b/RL/utils/rl_env.py
+index 4ea6f01..94998c1 100644
+--- a/RL/utils/rl_env.py
++++ b/RL/utils/rl_env.py
+@@ -107,10 +107,9 @@ class RL_Wrapper_P_DiffDiscreteEventSystem(DiffDiscreteEventSystem):
+         return queues.cpu().numpy(), {}
+     
+     def reset_env_seed(self):
+-        seed = self.seed
+-        # print(f"seed: {seed}")  
+-        if seed is not None:
+-            self.state = np.random.RandomState(seed)
++        if self.seed is not None:
++            self.state = torch.Generator(device=self.device)
++            self.state.manual_seed(self.seed)
+ 
+ 
+ def load_rl_p_env(env_config, temp, batch, seed, policy_name, device):
+@@ -165,14 +164,15 @@ def load_rl_p_env(env_config, temp, batch, seed, policy_name, device):
+         lam_r = lam_params['val']
+     def lam(t):
+             if lam_type == 'constant':
+-                lam = lam_r
++                lam_t = torch.as_tensor(lam_r, device=t.device, dtype=t.dtype)
+             elif lam_type == 'step':
+-                is_surge = 1*(t.data.cpu().numpy() <= lam_params['t_step'])
+-                lam = is_surge * np.array(lam_params['val1']) + (1 - is_surge) * np.array(lam_params['val2'])
++                is_surge = (t <= lam_params['t_step']).float()
++                v1 = torch.as_tensor(lam_params['val1'], device=t.device, dtype=t.dtype)
++                v2 = torch.as_tensor(lam_params['val2'], device=t.device, dtype=t.dtype)
++                lam_t = is_surge * v1 + (1 - is_surge) * v2
+             else:
+-                return 'Nonvalid arrival rate'
+-            
+-            return lam
++                raise ValueError(f'Nonvalid arrival rate type: {lam_type}')
++            return lam_t
+         
+ 
+     if env_config['queue_event_options'] == 'custom':
+@@ -181,20 +181,14 @@ def load_rl_p_env(env_config, temp, batch, seed, policy_name, device):
+ 
+ 
+     def draw_inter_arrivals(self, time):
+-
+-        def inter_arrival_dists(state, batch, t):
+-            exps = state.exponential(1, (batch, orig_q))
+-            lam_rate = lam(t)
+-            return exps / lam_rate
+-
+-        interarrivals = torch.tensor(inter_arrival_dists(self.state, self.batch, time)).to(self.device)
+-        return interarrivals
++        uniform = torch.rand(self.batch, orig_q, generator=self.state, device=self.device)
++        exps = -torch.log(1.0 - uniform)
++        lam_rate = lam(time)
++        return exps / lam_rate
+     
+     def draw_service(self, time):
+-        def service_dists(state, batch, t):
+-            return state.exponential(1, (batch, orig_q))
+-        service = torch.tensor(service_dists(self.state, self.batch, time)).to(self.device)
+-        return service
++        uniform = torch.rand(self.batch, orig_q, generator=self.state, device=self.device)
++        return -torch.log(1.0 - uniform)
+ 
+     # def draw_service(self, time):
+     #     def service_dists(state, batch, t):
+diff --git a/main/env.py b/main/env.py
+index 679699b..bd913d2 100644
+--- a/main/env.py
++++ b/main/env.py
+@@ -131,7 +131,9 @@ class DiffDiscreteEventSystem(gym.Env):
+         
+ 
+         self.device = device
+-        self.state = np.random.default_rng(seed)
++        self.state = torch.Generator(device=self.device)
++        if seed is not None:
++            self.state.manual_seed(seed)
+         self.network = network.repeat(batch,1,1).to(self.device)
+         self.mu = mu.repeat(batch,1,1).to(self.device)
+         self.q = self.network.size()[-1]
+@@ -196,7 +198,8 @@ class DiffDiscreteEventSystem(gym.Env):
+             queues = init_queues.float().to(self.device)
+         
+         if seed is not None:
+-            self.state = np.random.RandomState(seed)
++            self.state = torch.Generator(device=self.device)
++            self.state.manual_seed(seed)
+ 
+         # Tensor service times: st_data[Q, max_jobs], st_counts[Q]
+         self.st_counts = (queues[0].int() if self.batch == 1 else queues[:, 0].int()).to(self.device)
