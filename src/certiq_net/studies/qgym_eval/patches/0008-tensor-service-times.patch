@@ -1,0 +1,254 @@
+diff --git a/main/env.py b/main/env.py
+index fdf9600..8eaef1d 100644
+--- a/main/env.py
++++ b/main/env.py
+@@ -43,17 +43,9 @@ class STargmin(nn.Module):
+             return F.one_hot(torch.argmin(x), num_classes = x.size()[1]).float()
+         return F.one_hot(torch.argmin(x), num_classes = x.size()[1]) - self.softmax(-x/self.temp).detach() + self.softmax(-x/self.temp)
+     
+-def allocator(action, mu, queue_service_times):
+-    # Equivalent to: adj_const = action; adj_const[adj_const < 1] = 1;
+-    # mu_with_grad = mu * action / adj_const. Because adj_const is 1 where
+-    # action < 1 and action where action >= 1, this simplifies to: mu_with_grad
+-    # = mu*action where action < 1, and mu where action >= 1.
+-    #
+-    # This rewrite computes everything in two numpy arrays (one host sync for
+-    # action, one for mu) instead of O(s*q) per-cell .item() syncs and O(n log n)
+-    # per-comparison float() syncs in the sort key. Output contract is identical
+-    # (verified by test_allocator_equivalence.py over 2000 random inputs + a
+-    # golden-reference battery). Tie-breaking preserved via stable argsort.
++def allocator(action, mu, queue_counts):
++    # queue_counts: list[int] of job counts per queue (previously
++    # queue_service_times as list-of-lists; only len() was ever used).
+     num_q = action.size()[-1]
+     action_np = action[0].detach().numpy()
+     mu_np = mu[0].detach().numpy()
+@@ -62,9 +54,6 @@ def allocator(action, mu, queue_service_times):
+     mu_with_grad_np = mu_np * action_np / adj_const
+     a_np = mu_np * action_np
+ 
+-    # identify non-zero actions in row-major order (matches np.nonzero on a[0]).
+-    # Each (s,q) cell is repeated round(action) times — this preserves the
+-    # server-duplication semantics of the original line-52 loop.
+     nz_s, nz_q = np.nonzero(a_np)
+     counts = np.round(action_np[nz_s, nz_q]).astype(np.int64)
+     rep_s = np.repeat(nz_s, counts)
+@@ -72,7 +61,6 @@ def allocator(action, mu, queue_service_times):
+ 
+     mu_with_grad = torch.from_numpy(mu_with_grad_np)
+ 
+-    # build allocated action per queue
+     allocated_a = []
+     num_allocated = []
+     queue_nonzero_inds = {}
+@@ -85,14 +73,12 @@ def allocator(action, mu, queue_service_times):
+             continue
+ 
+         sels = rep_s[mask]
+-        # sort the indices by work (mu_with_grad), descending, stable to match
+-        # Python's sort(reverse=True) stability.
+         keys = mu_with_grad_np[sels, q]
+         order = np.argsort(-keys, kind='stable')
+         sorted_sels = sels[order]
+ 
+         queue_nonzero_inds[q] = [(int(s), q) for s in sorted_sels]
+-        num_allocated_jobs = min(len(queue_service_times[q]), len(sorted_sels))
++        num_allocated_jobs = min(queue_counts[q], len(sorted_sels))
+         num_allocated.append(num_allocated_jobs)
+ 
+         q_allocated_a = [mu_with_grad[int(s), q] for s in sorted_sels[:num_allocated_jobs]]
+@@ -175,20 +161,26 @@ class DiffDiscreteEventSystem(gym.Env):
+         if seed is not None:
+             self.state = np.random.RandomState(seed)
+ 
+-        service_times = [[self.draw_service(time) for _ in range(int(queues_sample[q]))] for q in range(self.q) for queues_sample in queues]
++        # Tensor service times: st_data[Q, max_jobs], st_counts[Q]
++        self.st_counts = queues[0].int() if self.batch == 1 else queues[:, 0].int()
++        max_init = max(self.st_counts.max().item(), 1)
++        self.st_data = torch.zeros((self.q, max_init), device=self.device)
++        for q in range(self.q):
++            c = self.st_counts[q].item()
++            for j in range(c):
++                self.st_data[q, j] = self.draw_service(time)[0, q]
+         arrival_times = self.draw_inter_arrivals(time)
+-        # print('init_arrival_times', arrival_times)
+ 
+         self.obs = Obs(queues, time)
+-        self.env_state = EnvState(queues, time, service_times, arrival_times)
++        self.env_state = EnvState(queues, time, self.st_data, arrival_times)
+         
+-        return Obs(queues, time), EnvState(queues, time, service_times, arrival_times)
++        return Obs(queues, time), EnvState(queues, time, self.st_data, arrival_times)
+ 
+     def step(self, action):
+         
+         # Compliance with network
+         state = self.env_state
+-        queues, time, service_times, arrival_times = state 
++        queues, time, _, arrival_times = state
+         # print(arrival_times)  
+         # print(queues)    
+         ###TODO Changed
+@@ -207,9 +199,8 @@ class DiffDiscreteEventSystem(gym.Env):
+         # work is action times mu
+ 
+         # allocate work to jobs
+-        #allocated_work = work
+-        allocated_work, queue_nonzero_inds, num_allocated = allocator(action, self.mu, service_times)
+-        # print(allocated_work)
++        st_counts_list = [int(self.st_counts[q]) for q in range(self.q)]
++        allocated_work, queue_nonzero_inds, num_allocated = allocator(action, self.mu, st_counts_list)
+ 
+ 
+         if self.f_verbose:
+@@ -220,46 +211,39 @@ class DiffDiscreteEventSystem(gym.Env):
+         # print(queues)
+         # print(action)
+         
+-        # effective service times are service_time divided by mu
+-        #eff_service_times = torch.stack([torch.min(torch.stack(self.service_times[q]) / torch.stack(allocated_work[q])) for q in range(self.q)])
+-        
+-        
+-        eff_service_times = [torch.tensor([self.inv_eps])]*self.q
++        min_eff_service_times = torch.full((1, self.q), self.inv_eps, device=self.device)
+         for q in range(self.q):
+-            if num_allocated[q] > 0:
+-                eff_service_times[q] = torch.stack(service_times[q][:num_allocated[q]])[:,0,q] / torch.clip(torch.stack(allocated_work[q]), min = self.eps)
+-                #eff_service_times[q] = torch.stack(self.service_times[q])[:num_allocated[q]] / allocated_work[q]
+-        
+-        min_eff_service_times = torch.stack([torch.min(eff_service_times[q]) for q in range(self.q)])
+-        min_eff_service_times = min_eff_service_times.unsqueeze(0)
++            n = num_allocated[q]
++            if n > 0:
++                st_vals = self.st_data[q, :n]
++                aw = torch.stack(allocated_work[q])
++                min_eff_service_times[0, q] = (st_vals / aw.clip(min=self.eps)).min()
+         
+         
+         # arrival times and service times are both q vectors
+         event_times = torch.cat((arrival_times, min_eff_service_times), dim=1).float()
+ 
+         if self.f_verbose:
+-            print(f"service:\t\t{service_times}")
+-            print(f"eff service:\t\t{eff_service_times}")
++            print(f"service:\t\t{self.st_data}")
+             print(f"eff service:\t\t{min_eff_service_times}")
+             print(f"event times:\t\t{event_times}")
+             print()
+ 
+         # if a job was served, which job in which queue
+-        if True:
+-        # with torch.no_grad():
+-            which_job = [0]*self.q
+-            for q in range(self.q):
+-                if num_allocated[q] > 0:
+-                    which_job[q] = int(torch.argmin(torch.stack(service_times[q][:num_allocated[q]]).detach()[:,0,q] / torch.stack(allocated_work[q])).detach())
+-                    #which_job[q] = int(torch.argmin(torch.stack(self.service_times[q])[:num_allocated[q]].detach().squeeze(1) / allocated_work[q]).detach())
++        which_job = [0]*self.q
++        for q in range(self.q):
++            n = num_allocated[q]
++            if n > 0:
++                st_vals = self.st_data[q, :n].detach()
++                aw = torch.stack(allocated_work[q])
++                which_job[q] = int(torch.argmin(st_vals / aw).detach())
+ 
+-            which_queue = int(torch.argmin(min_eff_service_times).detach())
+-            
+-            if self.f_verbose:
+-                print(f"which_queue:\t\t{which_queue}")
+-                print(f"which_job:\t\t{which_job}")
+-                #print(f"which_arrival:\t\t{which_arrival}")
+-                print()
++        which_queue = int(torch.argmin(min_eff_service_times).detach())
++
++        if self.f_verbose:
++            print(f"which_queue:\t\t{which_queue}")
++            print(f"which_job:\t\t{which_job}")
++            print()
+         
+         
+         # outcome is one_hot argmin of the event times
+@@ -324,24 +308,17 @@ class DiffDiscreteEventSystem(gym.Env):
+             #print(f"eff_elapsed_time:{allocated_work * event_time}")
+             print()
+         
+-        # update service times for all jobs with positive work
+-        # for q in range(self.q):
+-        #     for j in range(num_allocated[q]):
+-        #         self.service_times[q][j] = F.relu(self.service_times[q][j] - allocated_work[q][j] * event_time)
+-
+-
+-
+         for q in range(self.q):
+-            if num_allocated[q] > 0:
+-                service_times[q][:num_allocated[q]] = list(torch.unbind(torch.stack(service_times[q][:num_allocated[q]]) - event_time * torch.stack(allocated_work[q]).unsqueeze(1).unsqueeze(-1).expand(-1,-1,self.network.shape[-1])))
+-                # service_times[q][:nuqueuem_allocated[q]] = list(torch.unbind(torch.stack(service_times[q][:num_allocated[q]]) - event_time.detach() * torch.stack(allocated_work[q]).detach().unsqueeze(1).unsqueeze(-1).repeat((1,1,self.network.shape[-1]))))
++            n = num_allocated[q]
++            if n > 0:
++                self.st_data[q, :n] -= event_time * torch.stack(allocated_work[q])
+         # update arrival times
+         # if torch.min(arrival_times) == 0:
+         #     assert(False)
+         arrival_times = arrival_times - event_time
+ 
+         if self.f_verbose:
+-            print(f"new service times:\t\t{service_times}")
++            print(f"new service times:\t\t{self.st_data}")
+             print(f"new arrival times:\t\t{arrival_times}")
+             print()
+ 
+@@ -367,29 +344,35 @@ class DiffDiscreteEventSystem(gym.Env):
+                     arrival_times = arrival_times + torch.nan_to_num((new_arrival_times) * delta_arrived, nan = self.inv_eps)
+                 which_arrival = torch.argmax(delta_arrived)
+                 
+-                # service time of the new arrival
+-                service_times[which_arrival].append(new_service_time)
++                # service time of the new arrival (append to tensor)
++                c = int(self.st_counts[which_arrival].item())
++                if c >= self.st_data.size(1):
++                    pad = torch.zeros((self.q, 1), device=self.device)
++                    self.st_data = torch.cat([self.st_data, pad], dim=1)
++                self.st_data[which_arrival, c] = new_service_time[0, which_arrival]
++                self.st_counts[which_arrival] += 1
+ 
+                 if self.f_verbose:
+                     print('Arrival!')
+-                    print(f"new service times:\t\t{service_times}")
++                    print(f"new service times:\t\t{self.st_data}")
+                     print(f"new arrival times:\t\t{arrival_times}")
+                     print()
+             
+             if torch.sum(delta_left) > 0:
+-                # remove a served job
+-                service_times[which_queue][which_job[which_queue]] = service_times[which_queue][which_job[which_queue]].detach()
+-                popped_job = service_times[which_queue].pop(which_job[which_queue])
+-                del popped_job
++                # remove a served job (shift left in tensor)
++                j = which_job[which_queue]
++                c = int(self.st_counts[which_queue].item())
++                if j < c - 1:
++                    self.st_data[which_queue, j:c-1] = self.st_data[which_queue, j+1:c].detach().clone()
++                self.st_counts[which_queue] -= 1
+ 
+                 if self.f_verbose:
+                     print('Service!')
+-                    #print(f"popped job:\t\t{popped_job}")
+-                    print(f"service times:\t\t{service_times}")
++                    print(f"service times:\t\t{self.st_data}")
+                     print()
+ 
+         
+-        next_state = EnvState(queues, time, service_times, arrival_times)
++        next_state = EnvState(queues, time, self.st_data, arrival_times)
+         obs = Obs(queues, time)
+ 
+         self.env_state = next_state
+@@ -410,7 +393,7 @@ class DiffDiscreteEventSystem(gym.Env):
+         print(f"Total Cost:\t{self.cost}")
+         print(f"Time Elapsed:\t{self.time_elapsed}")
+         print(f"Queue Len:\t{self.queues}")
+-        print(f"Service times:\t{self.service_times}")
++        print(f"Service times:\t{self.st_data}")
+         print(f"Arrival times:\t{self.arrival_times}")
+         # else:
+         #     print(f"Work:\t{self.work}")

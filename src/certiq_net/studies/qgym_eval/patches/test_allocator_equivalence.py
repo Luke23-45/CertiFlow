@@ -129,8 +129,8 @@ def _run_allocator(inputs):
     """Run the on-disk allocator over all inputs, capture comparable outputs."""
     results = []
     for name, action_t, mu_t, st in inputs:
-        # allocator may mutate nothing, but pass fresh copies to be safe.
-        allocated_a, qni, num_alloc = allocator(action_t, mu_t, [list(x) for x in st])
+        # allocator accepts queue_counts (list of ints) instead of service_times lists.
+        allocated_a, qni, num_alloc = allocator(action_t, mu_t, [len(x) for x in st])
         # Convert to plain Python/numpy for pickling + comparison. Each element of
         # allocated_a[q] is a 0-d tensor (value = mu_with_grad[0][s][q]); coerce
         # robustly via float(tensor) which works for 0-d and 1-element tensors.
