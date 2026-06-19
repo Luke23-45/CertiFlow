@@ -63,7 +63,7 @@ class CertiqPPOTrainer(CustomPPOTrainer):
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
 
-            for rollout_data in self.rollout_buffer.get():
+            for rollout_data in self.rollout_buffer.get(self.batch_size):
                 actions = rollout_data.actions
 
                 log_prob, entropy = self.policy.evaluate_actions(

@@ -1,0 +1,15 @@
+diff --git a/main/env.py b/main/env.py
+index 2431e9c..327b7b1 100644
+--- a/main/env.py
++++ b/main/env.py
+@@ -587,6 +587,10 @@ class BatchedEnv:
+                     self.st_data[bd[need_swap], qd[need_swap], cd[need_swap] - 1]
+             self.st_counts[bd, qd] = cd - 1
+ 
++            max_cols = int(self.st_counts.max().item()) + 1
++            if max_cols * 2 < self.st_data.size(-1):
++                self.st_data = self.st_data[:, :, :max_cols]
++
+         done = np.zeros(self.B, dtype=bool)
+         reward = -cost.detach().cpu().numpy()
+         infos = [{} for _ in range(self.B)]
