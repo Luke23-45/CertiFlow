@@ -1,5 +1,5 @@
 diff --git a/RL/utils/rollout_buffer.py b/RL/utils/rollout_buffer.py
-index 4b35e16..9943e9f 100644
+index 4b35e16..28da664 100644
 --- a/RL/utils/rollout_buffer.py
 +++ b/RL/utils/rollout_buffer.py
 @@ -149,7 +149,8 @@ class CustomRolloutBuffer(RolloutBuffer):
@@ -8,7 +8,7 @@ index 4b35e16..9943e9f 100644
          # normalize the advantages and returns
 -        self.advantages = self.advantages / self.adv_std
 +        self.advantages = (self.advantages - self.advantages.mean()) / self.adv_std
-+        self.advantages = torch.clamp(self.advantages, -10, 10)
++        self.advantages = th.clamp(self.advantages, -10, 10)
          self.returns = (self.returns - self.returns_mean) / self.returns_std
  
          ### log normalization stats
