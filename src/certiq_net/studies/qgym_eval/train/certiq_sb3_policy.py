@@ -158,7 +158,7 @@ class CertiQSB3Policy(ActorCriticPolicy):
     ) -> tuple[Tensor, Tensor, Tensor]:
         obs = obs.view(-1, self.q)
 
-        pi, value, _ = self._run_certiq(obs)
+        pi, _, _ = self._run_certiq(obs)
         action_probs = self._expand_pi_to_priority(pi)
 
         if deterministic:
@@ -171,7 +171,14 @@ class CertiQSB3Policy(ActorCriticPolicy):
         selected_probs = (action * action_probs).sum(dim=-1)
         log_prob = torch.log(selected_probs.clamp(min=1e-10)).sum(dim=1)
 
-        return action.float(), value.unsqueeze(-1), log_prob
+        # Value stored in the rollout buffer and used as the GAE bootstrap
+        # must be in RAW scale (consistent with raw rewards), so route it
+        # through predict_values (which applies rescale_v).  Returning the
+        # raw value head here broke the rescale_v contract and re-introduced
+        # the critic target/prediction scale mismatch (RC1).
+        value = self.predict_values(obs)
+
+        return action.float(), value, log_prob
 
     def _get_prob_act(
         self, obs: Tensor, deterministic: bool = False
@@ -201,13 +208,44 @@ class CertiQSB3Policy(ActorCriticPolicy):
         log_prob = torch.log(selected_probs.clamp(min=1e-10)).sum(dim=1)
         return log_prob, None
 
+    def rescale_values(self, values: Tensor) -> Tensor:
+        """Map a normalized value-head output back to RAW return scale.
+
+        Mirrors the original QGym ``vanilla_policy.rescale_values``.  The
+        value head is trained against NORMALIZED returns (~N(0,1)), so its
+        raw output is in normalized space; the GAE bootstrap needs raw-scale
+        values to be consistent with raw rewards, hence this rescale.
+        """
+        return values * self.returns_std + self.returns_mean
+
     def predict_values(self, obs: PyTorchObs) -> Tensor:
+        """Value used for the GAE bootstrap (RAW scale when ``rescale_v``).
+
+        Returns the value head's output rescaled to raw return scale so that
+        GAE math (which uses raw rewards) is consistent.  This is the contract
+        the original QGym ``vanilla_policy`` enforced and that ``CertiQSB3Policy``
+        had dropped — dropping it caused the critic target/prediction scale
+        mismatch (RC1) and, under raw-scale returns, a GAE feedback loop that
+        diverged the value head (44 -> 595 on the cloud run).
+        """
+        obs = obs.view(-1, self.q)
+        _, value, _ = self._run_certiq(obs)
+        value = value.unsqueeze(-1)
+        if self._rescale_v:
+            value = self.rescale_values(value)
+        return value
+
+    def evaluate_values(self, obs: PyTorchObs) -> Tensor:
+        """Value used for the value-loss target (NORMALIZED, matches returns).
+
+        Returns the raw value-head output WITHOUT rescale: the buffer stores
+        NORMALIZED returns, and the head is trained to predict in normalized
+        space.  This is the mirror of ``predict_values``'s rescale and keeps
+        the critic target/prediction in the SAME (normalized) scale.
+        """
         obs = obs.view(-1, self.q)
         _, value, _ = self._run_certiq(obs)
         return value.unsqueeze(-1)
-
-    def evaluate_values(self, obs: PyTorchObs) -> Tensor:
-        return self.predict_values(obs)
 
     def predict(
         self,

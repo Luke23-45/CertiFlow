@@ -35,8 +35,6 @@ NU_MAX = 10.0
 # Maximum per-iteration change in ``nu``.  Caps the ratchet speed so one bad
 # rollout cannot blow the penalty up.
 NU_DELTA_MAX = 0.5
-# EMA decay for the running std of ``excess`` used to normalise the penalty.
-EXCESS_STD_EMA_DECAY = 0.95
 # A policy is considered "frozen" when the mean absolute deviation of the
 # importance-sampling ratio from 1 drops below this.  In that regime the
 # surrogate gradient is ~0, so the Lagrangian penalty cannot move the policy
@@ -44,6 +42,16 @@ EXCESS_STD_EMA_DECAY = 0.95
 FROZEN_RATIO_EPS = 1e-3
 # Residual clip + Huber beta for the value loss (mirrors patch 0022).
 VALUE_RESIDUAL_CLIP = 10.0
+# Lagrangian cost scale: violations are in raw-cost units (~O(1000)), so we
+# divide by LAGR_SCALE to bring the penalty to O(1) before applying nu.
+LAGR_SCALE = 1000.0
+# The constraint penalty may never exceed this fraction of the surrogate
+# policy-loss magnitude.  The cloud run showed lag_loss=575 vs pg_loss=0.038
+# (15,000x) which made the constraint dominate the reward signal and drove
+# the policy to a degenerate queue-exploding solution.  0.5 keeps the
+# constraint a minority contributor to the policy gradient so the reward
+# signal always leads; the constraint trims rather than dictates.
+LAG_MAX_FRAC = 0.5
 
 
 class CertiqPPOTrainer(CustomPPOTrainer):
@@ -57,8 +65,6 @@ class CertiqPPOTrainer(CustomPPOTrainer):
     def __init__(self, *args: Any, lr_nu: float = 1e-3, **kwargs: Any) -> None:
         self.lr_nu = lr_nu
         self._nu_val = 0.0  # dual variable as Python float
-        # Running EMA std of ``excess`` for scale-invariant penalty (RC4).
-        self._excess_std_ema = 1.0
         super().__init__(*args, **kwargs)
 
     def _robust_value_loss(
@@ -171,13 +177,20 @@ class CertiqPPOTrainer(CustomPPOTrainer):
                     excess = a_final - budget  # can be negative
                     violation = excess.clamp(min=0.0)
 
-                    # Scale-invariant penalty: normalise by the running std
-                    # of ``excess`` instead of the old magic /1000 constant.
+                    # Penalty: nu * violation, normalised by LAGR_SCALE so the
+                    # raw-cost-scale violation (~O(1000)) becomes O(1).  The
+                    # cloud run showed the penalty MUST stay small relative to
+                    # the surrogate policy gradient, otherwise it dominates the
+                    # reward signal and the policy degenerates.  Cap lag_loss
+                    # at LAG_MAX_FRAC * |policy_loss| so the constraint can
+                    # never overwhelm the reward objective.
                     lag_loss = (
-                        self._nu_val
-                        * violation.mean()
-                        / max(self._excess_std_ema, 1e-8)
+                        self._nu_val * violation.mean() / LAGR_SCALE
                     )
+                    with th.no_grad():
+                        pg_mag = policy_loss.abs() + 1e-8
+                        lag_cap = LAG_MAX_FRAC * pg_mag
+                        lag_loss = th.min(lag_loss, lag_cap)
                     excess_means.append(excess.mean().item())
                 lagrangian_losses.append(lag_loss.item())
                 policy_loss = policy_loss + lag_loss
@@ -243,20 +256,15 @@ class CertiqPPOTrainer(CustomPPOTrainer):
                 break
 
         # --- Dual variable update (RC4 safeguards) ---
-        # nu = clip(nu + lr_nu * excess_norm, 0, NU_MAX), with the per-iter
-        # delta itself capped.  excess is normalised by its running std so the
-        # update magnitude is scale-invariant (no more /1000 magic constant).
+        # nu = clip(nu + lr_nu * excess / LAGR_SCALE, 0, NU_MAX), with the
+        # per-iteration delta capped.  excess is in raw-cost scale (~O(1000)),
+        # so dividing by LAGR_SCALE brings the update to O(1) — matching the
+        # penalty's LAGR_SCALE divisor keeps the dual ascent consistent with
+        # the primal descent.  The per-iter cap and NU_MAX bound prevent the
+        # ratchet from running away on a structurally-unsatisfiable constraint.
         if excess_means:
             avg_excess = th.tensor(excess_means).mean().item()
-            batch_excess_std = (
-                th.tensor(excess_means).std().item() if len(excess_means) > 1 else 0.0
-            )
-            if batch_excess_std > 0:
-                self._excess_std_ema = (
-                    EXCESS_STD_EMA_DECAY * self._excess_std_ema
-                    + (1.0 - EXCESS_STD_EMA_DECAY) * batch_excess_std
-                )
-            nu_delta = self.lr_nu * avg_excess / max(self._excess_std_ema, 1e-8)
+            nu_delta = self.lr_nu * avg_excess / LAGR_SCALE
             nu_delta = max(-NU_DELTA_MAX, min(NU_DELTA_MAX, nu_delta))
             self._nu_val = max(0.0, min(NU_MAX, self._nu_val + nu_delta))
 
@@ -283,4 +291,3 @@ class CertiqPPOTrainer(CustomPPOTrainer):
         self.logger.record("train/entropy_loss", th.tensor(entropy_losses).mean().item())
         self.logger.record("train/nu", self._nu_val)
         self.logger.record("train/ratio_dev", th.tensor(ratio_devs).mean().item())
-        self.logger.record("train/excess_std_ema", self._excess_std_ema)
