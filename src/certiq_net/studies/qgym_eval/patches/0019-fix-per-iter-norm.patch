@@ -1,5 +1,5 @@
 diff --git a/RL/utils/rollout_buffer.py b/RL/utils/rollout_buffer.py
-index 4b35e16..97a7c00 100644
+index 5abbf94..a5f007a 100644
 --- a/RL/utils/rollout_buffer.py
 +++ b/RL/utils/rollout_buffer.py
 @@ -133,20 +133,11 @@ class CustomRolloutBuffer(RolloutBuffer):
@@ -25,4 +25,4 @@ index 4b35e16..97a7c00 100644
 +            self.returns_std = returns_std * self.var_scaler
  
          # normalize the advantages and returns
-         self.advantages = self.advantages / self.adv_std
+         self.advantages = (self.advantages - self.advantages.mean()) / self.adv_std
