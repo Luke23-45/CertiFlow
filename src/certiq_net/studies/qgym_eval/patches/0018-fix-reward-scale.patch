@@ -1,0 +1,13 @@
+diff --git a/main/env.py b/main/env.py
+index 5420437..50f323b 100644
+--- a/main/env.py
++++ b/main/env.py
+@@ -376,7 +376,7 @@ class DiffDiscreteEventSystem(gym.Env):
+ 
+         done = False
+         truncated = False
+-        reward = -cost
++        reward = -cost / 1000.0
+ 
+         info = {"obs": obs, "state": next_state, "cost": cost, "event_time": event_time, "queues": queues}
+ 

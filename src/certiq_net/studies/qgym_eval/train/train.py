@@ -318,7 +318,7 @@ def main() -> None:
         ent_coef=policy_cfg["training"]["ent_coef"],
         actors=actors,
         vf_coef=policy_cfg["training"]["vf_coef"],
-        max_grad_norm=1.0,
+        max_grad_norm=0.5,
         use_sde=False,
         sde_sample_freq=-1,
         rollout_buffer_class=CustomRolloutBuffer,

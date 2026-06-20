@@ -22,7 +22,7 @@ training:
   amp_value: False
   var_scaler: 1.0
   per_iter_normal_obs: False
-  per_iter_normal_value: False
+  per_iter_normal_value: True
   actors: 4
   episode_steps: 500
   num_epochs: 2
@@ -40,7 +40,7 @@ training:
   batch_size: 500
   ppo_epochs: 1
   clip_range_vf: null 
-  ent_coef: 0.0  
+  ent_coef: 0.01  
 policy: 
   test_policy: 'vanilla' 
 plot: 

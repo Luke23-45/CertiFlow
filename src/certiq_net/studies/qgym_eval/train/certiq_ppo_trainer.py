@@ -10,6 +10,13 @@ import torch.nn as nn
 
 from certiq_net.studies.qgym_eval.train.qgym_import import CustomPPOTrainer
 
+# Scaling factor to balance Lagrangian constraint loss against the
+# normalized policy-gradient loss.  The raw cost values from the
+# environment are O(1000) larger than the normalized advantages, so
+# the Lagrangian penalty must be divided by this factor to prevent
+# the constraint gradient from dominating and destroying the policy.
+LAGR_SCALE = 1000.0
+
 
 class CertiqPPOTrainer(CustomPPOTrainer):
     """Extends QGym's ``CustomPPOTrainer`` with the CertiQ Lagrangian
@@ -103,7 +110,7 @@ class CertiqPPOTrainer(CustomPPOTrainer):
                 excess = a_final - budget  # can be negative
                 violation = excess.clamp(min=0.0)
 
-                lag_loss = self._nu_val * violation.mean()
+                lag_loss = self._nu_val * violation.mean() / LAGR_SCALE
                 lagrangian_losses.append(lag_loss.item())
                 policy_loss = policy_loss + lag_loss
 
@@ -172,7 +179,7 @@ class CertiqPPOTrainer(CustomPPOTrainer):
 
         # --- Dual variable update: nu = max(0, nu + lr_nu * excess_mean) ---
         avg_excess = th.tensor(excess_means).mean().item()
-        self._nu_val = max(0.0, self._nu_val + self.lr_nu * avg_excess)
+        self._nu_val = max(0.0, self._nu_val + self.lr_nu * avg_excess / LAGR_SCALE)
 
         training_time_end = time.time()
         print(f"training_time: {training_time_end - training_time_start}")
