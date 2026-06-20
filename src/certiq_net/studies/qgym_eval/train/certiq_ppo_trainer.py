@@ -201,4 +201,5 @@ class CertiqPPOTrainer(CustomPPOTrainer):
             "train/lagrangian_loss",
             th.tensor(lagrangian_losses).mean().item(),
         )
+        self.logger.record("train/entropy_loss", th.tensor(entropy_losses).mean().item())
         self.logger.record("train/nu", self._nu_val)
