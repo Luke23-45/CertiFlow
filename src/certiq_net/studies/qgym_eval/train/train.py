@@ -288,8 +288,12 @@ def main() -> None:
         per_iter_normal_value=policy_cfg["training"]["per_iter_normal_value"],
     )
 
+    lr_base = policy_cfg["training"]["lr"]
+    if isinstance(lr_base, (float, int)):
+        lr_base = min(float(lr_base), 3e-4)
+
     trainer_kwargs = dict(
-        learning_rate=policy_cfg["training"]["lr"],
+        learning_rate=lr_base,
         lr_policy=policy_cfg["training"]["lr_policy"],
         lr_value=policy_cfg["training"]["lr_value"],
         min_lr_policy=policy_cfg["training"]["min_lr_policy"],

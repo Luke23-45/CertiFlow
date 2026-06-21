@@ -1,4 +1,4 @@
-﻿"""CertiQ index model for marginal-cost dispatch with PPO-Lagrangian constraint."""
+"""CertiQ index model for marginal-cost dispatch with PPO-Lagrangian constraint."""
 
 from __future__ import annotations
 
@@ -60,6 +60,7 @@ class MarginalIndexHead(nn.Module):
             nn.Linear(hidden_dim + hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
+            nn.Tanh()
         )
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
