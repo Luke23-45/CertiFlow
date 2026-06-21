@@ -13,6 +13,16 @@ def project_root() -> Path:
     return Path(certiq_net.__file__).resolve().parents[2]
 
 
+def certiq_package_root() -> Path:
+    """Return the installed package directory ``src/certiq_net``."""
+    return Path(certiq_net.__file__).resolve().parent
+
+
+def certiq_model_config_path() -> Path:
+    """Return the default CertiQ model config path."""
+    return certiq_package_root() / "configs" / "model" / "certiq_index.yaml"
+
+
 def _candidate_roots() -> list[Path]:
     root = project_root()
     candidates: list[Path] = []

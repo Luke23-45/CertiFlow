@@ -23,7 +23,11 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from certiq_net.studies.qgym_eval._qgym_paths import project_root, resolve_qgym_root
+from certiq_net.studies.qgym_eval._qgym_paths import (
+    certiq_model_config_path,
+    project_root,
+    resolve_qgym_root,
+)
 from certiq_net.studies.qgym_eval.train.certiq_sb3_policy import CertiQSB3Policy
 from certiq_net.studies.qgym_eval.train.qgym_import import load_rl_p_env
 
@@ -284,7 +288,7 @@ def run_evaluation(args: argparse.Namespace) -> dict:
     if args.model_config:
         model_config_path = Path(args.model_config).resolve()
     else:
-        model_config_path = project_root() / "configs" / "model" / "certiq_index.yaml"
+        model_config_path = certiq_model_config_path()
 
     result = evaluate_checkpoint(
         env_name=args.env,

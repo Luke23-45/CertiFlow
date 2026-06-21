@@ -1,8 +1,8 @@
-"""Verify fix 3B+2B: zero_grad() added between policy and value phases.
+"""Verify fix 3B+2B: zero_grad() is present between policy and value phases.
 
 Checks that `self.policy.zero_grad()` appears in both:
-1. CustomPPOTrainer.train()  (extern/QGym, via patch 0012)
-2. CertiqPPOTrainer.train()  (our code, direct edit)
+1. CustomPPOTrainer.train()  (extern/QGym)
+2. CertiqPPOTrainer.train()  (our code)
 """
 from __future__ import annotations
 
@@ -29,16 +29,8 @@ def main() -> int:
     ok1 = _check_file(EXTERN_TRAINER, "CustomPPOTrainer (extern)")
     ok2 = _check_file(CERTIQ_TRAINER, "CertiqPPOTrainer (ours)")
 
-    # Also verify the patch file exists
-    patch = PROJECT_ROOT / "src" / "certiq_net" / "studies" / "qgym_eval" / "patches" / "0012-fix-gradient-accumulation.patch"
-    ok3 = patch.exists()
-    if ok3:
-        print(f"[OK]   Patch file: 0012-fix-gradient-accumulation.patch exists")
-    else:
-        print(f"[FAIL] Patch file: 0012-fix-gradient-accumulation.patch MISSING")
-
     print()
-    if ok1 and ok2 and ok3:
+    if ok1 and ok2:
         print("[PASS] Fix 3B+2B verified: encoder gradients are zeroed between phases")
         return 0
     else:

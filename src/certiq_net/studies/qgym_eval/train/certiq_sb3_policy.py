@@ -84,16 +84,13 @@ class CertiQSB3Policy(ActorCriticPolicy):
     @staticmethod
     def _load_certiq_model_config() -> dict:
         """Load certiq_index.yaml from the package config directory."""
-        from pathlib import Path
-
         import yaml
 
-        import certiq_net
-
-        cfg_path = (
-            Path(certiq_net.__file__).resolve().parents[2]
-            / "configs" / "model" / "certiq_index.yaml"
+        from certiq_net.studies.qgym_eval._qgym_paths import (
+            certiq_model_config_path,
         )
+
+        cfg_path = certiq_model_config_path()
         if cfg_path.exists():
             with open(cfg_path) as f:
                 cfg = yaml.safe_load(f)

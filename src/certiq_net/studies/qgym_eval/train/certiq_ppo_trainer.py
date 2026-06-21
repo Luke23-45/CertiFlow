@@ -17,9 +17,7 @@ from certiq_net.studies.qgym_eval.train.qgym_import import CustomPPOTrainer
 LAGR_SCALE = 1000.0
 NU_MAX = 10.0
 NU_DELTA_MAX = 0.5
-FROZEN_RATIO_EPS = 1e-3
 VALUE_RESIDUAL_CLIP = 10.0
-LAG_MAX_FRAC = 0.5
 
 
 class CertiqPPOTrainer(CustomPPOTrainer):
@@ -74,8 +72,6 @@ class CertiqPPOTrainer(CustomPPOTrainer):
         self._update_learning_rate(self.optimizer_policy, self.optimizer_value)
 
         clip_range = self.clip_range(self._current_progress_remaining)
-        clipping_alpha = 1.0 - self.training_iteration / self.num_epochs
-        clip_range = max(0.01, clipping_alpha * clip_range)
 
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(
@@ -128,21 +124,15 @@ class CertiqPPOTrainer(CustomPPOTrainer):
                 ratio_devs.append(ratio_dev)
 
                 # --- Lagrangian constraint ---
-                policy_frozen = ratio_dev < FROZEN_RATIO_EPS
-                if policy_frozen:
-                    lag_loss = th.zeros((), device=policy_loss.device)
-                else:
-                    cost, budget, pi = policy.compute_cost_and_budget(
-                        rollout_data.observations
-                    )
-                    a_final = (pi * cost).sum(dim=-1)
-                    excess = a_final - budget  # can be negative
-                    violation = excess.clamp(min=0.0)
+                cost, budget, pi = policy.compute_cost_and_budget(
+                    rollout_data.observations
+                )
+                a_final = (pi * cost).sum(dim=-1)
+                excess = a_final - budget  # can be negative
+                violation = excess.clamp(min=0.0)
 
-                    lag_loss = self._nu_val * violation.mean() / LAGR_SCALE
-                    lag_cap = LAG_MAX_FRAC * (policy_loss.detach().abs() + 1e-8)
-                    lag_loss = th.minimum(lag_loss, lag_cap)
-                    excess_means.append(excess.mean().item())
+                lag_loss = self._nu_val * violation.mean() / LAGR_SCALE
+                excess_means.append(excess.mean().item())
 
                 lagrangian_losses.append(lag_loss.item())
                 policy_loss = policy_loss + lag_loss

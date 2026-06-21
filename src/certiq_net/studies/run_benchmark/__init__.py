@@ -32,7 +32,10 @@ from pathlib import Path
 
 import numpy as np
 
-from certiq_net.studies.qgym_eval._qgym_paths import resolve_qgym_root
+from certiq_net.studies.qgym_eval._qgym_paths import (
+    certiq_model_config_path,
+    resolve_qgym_root,
+)
 
 # ---------------------------------------------------------------------------
 # Benchmark environment definitions
@@ -360,9 +363,7 @@ def main() -> None:
     if args.model_config:
         model_config_path = Path(args.model_config).resolve()
     else:
-        import certiq_net
-        certiq_net_root = Path(certiq_net.__file__).resolve().parent.parent
-        model_config_path = certiq_net_root / "configs" / "model" / "certiq_index.yaml"
+        model_config_path = certiq_model_config_path()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
