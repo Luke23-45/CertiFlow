@@ -428,6 +428,91 @@ def test_rescale_v_contract():
     print("[rescale_v] PASS: predict_values=raw, evaluate_values=normalized, contract intact.")
 
 
+def test_rescale_v_extreme_stats_are_bounded():
+    """Regression for the cloud log's 8k -> 1e12 value bootstrap feedback."""
+    torch.manual_seed(42)
+    device = torch.device("cpu")
+    policy = _make_policy(device)
+    obs = torch.rand(16, 6, device=device) * 30.0
+
+    policy.update_rollout_stats(returns_mean=1.0e12, returns_std=1.0e12)
+    with torch.no_grad():
+        norm_head = policy.evaluate_values(obs)
+        raw_pred = policy.predict_values(obs)
+
+    assert norm_head.abs().max() <= 5.0 + 1e-5, (
+        f"normalized value head escaped bound: max={norm_head.abs().max().item():.3f}"
+    )
+    assert raw_pred.abs().max() <= 105_000.0 + 1e-5, (
+        f"raw bootstrap value still explosive: max={raw_pred.abs().max().item():.3f}"
+    )
+    print(
+        "[rescale_v-extreme] PASS: extreme rollout stats are capped before raw bootstrap "
+        f"(raw max={raw_pred.abs().max().item():.1f})."
+    )
+
+
+def test_rollout_return_std_capped():
+    """A pathological reward stream must not set future bootstrap std to infinity."""
+    import torch as th
+
+    device = torch.device("cpu")
+    buffer = CustomRolloutBuffer(
+        16, _OBS_SPACE, _ACT_SPACE,
+        device=device, gae_lambda=0.99, gamma=0.998, n_envs=1,
+        q=6, normalize_advantage=True, normalize_value=True,
+        normalize_reward=True, truncation=False, var_scaler=1.0,
+        per_iter_normal_value=True,
+    )
+    buffer.reset()
+    for _ in range(16):
+        buffer.add(
+            np.zeros(6, dtype=np.float32),
+            np.zeros((2, 6), dtype=np.float32),
+            np.array([-1.0e9], dtype=np.float32),
+            np.array([0.0], dtype=np.float32),
+            th.zeros(1),
+            th.zeros(1),
+        )
+
+    _, returns_std = buffer.compute_returns_and_advantage(
+        th.zeros(1), np.array([0.0], dtype=np.float32)
+    )
+    assert returns_std <= 1_000.0, (
+        f"returns_std cap failed: got {returns_std:.3f}, expected <= 1000"
+    )
+    assert buffer.rewards.min() >= -50.0, (
+        f"reward clamp failed: min reward={buffer.rewards.min():.3f}"
+    )
+    print(
+        f"[returns-std-cap] PASS: returns_std={returns_std:.3f}, "
+        f"reward_min={buffer.rewards.min():.3f}."
+    )
+
+
+def test_lagrangian_cap_preserves_gradient_below_cap():
+    """The cap must not detach the Lagrangian penalty before it reaches the cap."""
+    import torch as th
+
+    pi_logits = th.tensor([[0.0, 0.0]], requires_grad=True)
+    pi = th.softmax(pi_logits, dim=-1)
+    cost = th.tensor([[1.0, 3.0]])
+    budget = th.tensor([0.0])
+    violation = ((pi * cost).sum(dim=-1) - budget).clamp(min=0.0)
+
+    # Choose a large cap so the raw Lagrangian is active and should backprop.
+    lag_raw = 0.1 * violation.mean() / 1000.0
+    lag_cap = th.tensor(1.0)
+    lag_loss = th.minimum(lag_raw, lag_cap)
+    lag_loss.backward()
+
+    assert pi_logits.grad is not None
+    assert pi_logits.grad.abs().sum().item() > 0.0, (
+        "capped Lagrangian loss was detached; constraint cannot train the policy"
+    )
+    print("[lag-grad] PASS: capped Lagrangian preserves gradient below the cap.")
+
+
 if __name__ == "__main__":
     test_rc1_value_loss_bounded()
     test_rc1_value_head_does_not_diverge()
@@ -435,4 +520,7 @@ if __name__ == "__main__":
     test_rc3_reward_clamped()
     test_rc4_lagrangian_bounded()
     test_rescale_v_contract()
+    test_rescale_v_extreme_stats_are_bounded()
+    test_rollout_return_std_capped()
+    test_lagrangian_cap_preserves_gradient_below_cap()
     print("\n[ALL] all RC validation tests passed.")

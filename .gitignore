@@ -9,3 +9,4 @@ results/
 *.egg-info/
 docs
 legacy
+logs.md

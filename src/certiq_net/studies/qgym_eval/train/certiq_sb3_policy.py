@@ -13,6 +13,10 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from torch import Tensor
 
+VALUE_HEAD_CLIP = 5.0
+RETURNS_STD_MAX = 1_000.0
+RETURNS_MEAN_ABS_MAX = 100_000.0
+
 
 class _DummyMLPExtractor(nn.Module):
     """Minimal zero-param MLP extractor for SB3 compatibility.
@@ -149,13 +153,24 @@ class CertiQSB3Policy(ActorCriticPolicy):
         batch_size = obs.shape[0]
         mu_batch = self._mu_eff.unsqueeze(0).expand(batch_size, -1)
         logits, value = self.marginal_index_head(obs, mu_batch, xi=None)
+        value = self._bound_normalized_value(value)
         proposal_logits = -logits / self.tau
         pi = F.softmax(proposal_logits.clamp(-20, 20), dim=-1)
         return pi, value, logits
 
+    @staticmethod
+    def _bound_normalized_value(values: Tensor) -> Tensor:
+        """Smoothly bound normalized critic outputs before raw-scale rescaling."""
+        return VALUE_HEAD_CLIP * torch.tanh(values / VALUE_HEAD_CLIP)
+
     def rescale_values(self, values: Tensor) -> Tensor:
         """Map normalized value predictions back to raw return scale."""
-        return values * self.returns_std + self.returns_mean
+        std = min(float(self.returns_std), RETURNS_STD_MAX)
+        mean = max(
+            -RETURNS_MEAN_ABS_MAX,
+            min(RETURNS_MEAN_ABS_MAX, float(self.returns_mean)),
+        )
+        return values * std + mean
 
     def forward(
         self, obs: Tensor, deterministic: bool = False
@@ -248,8 +263,11 @@ class CertiQSB3Policy(ActorCriticPolicy):
     def update_rollout_stats(
         self, returns_mean: float, returns_std: float
     ) -> None:
-        self.returns_mean = returns_mean
-        self.returns_std = max(returns_std, 1e-8)
+        self.returns_mean = max(
+            -RETURNS_MEAN_ABS_MAX,
+            min(RETURNS_MEAN_ABS_MAX, float(returns_mean)),
+        )
+        self.returns_std = max(min(float(returns_std), RETURNS_STD_MAX), 1e-8)
 
     def compute_cost_and_budget(self, obs: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Compute cost, budget, and per-queue probs for the constraint.

@@ -140,10 +140,8 @@ class CertiqPPOTrainer(CustomPPOTrainer):
                     violation = excess.clamp(min=0.0)
 
                     lag_loss = self._nu_val * violation.mean() / LAGR_SCALE
-                    with th.no_grad():
-                        pg_mag = policy_loss.abs() + 1e-8
-                        lag_cap = LAG_MAX_FRAC * pg_mag
-                        lag_loss = th.min(lag_loss, lag_cap)
+                    lag_cap = LAG_MAX_FRAC * (policy_loss.detach().abs() + 1e-8)
+                    lag_loss = th.minimum(lag_loss, lag_cap)
                     excess_means.append(excess.mean().item())
 
                 lagrangian_losses.append(lag_loss.item())
