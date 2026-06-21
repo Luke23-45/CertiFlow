@@ -23,7 +23,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-import certiq_net
+from certiq_net.studies.qgym_eval._qgym_paths import project_root, resolve_qgym_root
 from certiq_net.studies.qgym_eval.train.certiq_sb3_policy import CertiQSB3Policy
 from certiq_net.studies.qgym_eval.train.qgym_import import load_rl_p_env
 
@@ -273,17 +273,18 @@ def evaluate_checkpoint(
 
 
 def run_evaluation(args: argparse.Namespace) -> dict:
-    project_root = Path(certiq_net.__file__).resolve().parents[2]
-
-    qgym_root = Path(args.qgym_root).resolve() if args.qgym_root else project_root / "extern" / "QGym"
-    if not qgym_root.exists():
-        print(f"QGym root not found: {qgym_root}", file=sys.stderr)
-        sys.exit(1)
+    if args.qgym_root:
+        qgym_root = Path(args.qgym_root).resolve()
+        if not (qgym_root / "RL" / "PPO" / "trainer.py").exists():
+            print(f"QGym root not found or invalid: {qgym_root}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        qgym_root = resolve_qgym_root()
 
     if args.model_config:
         model_config_path = Path(args.model_config).resolve()
     else:
-        model_config_path = project_root / "configs" / "model" / "certiq_index.yaml"
+        model_config_path = project_root() / "configs" / "model" / "certiq_index.yaml"
 
     result = evaluate_checkpoint(
         env_name=args.env,

@@ -32,6 +32,8 @@ from pathlib import Path
 
 import numpy as np
 
+from certiq_net.studies.qgym_eval._qgym_paths import resolve_qgym_root
+
 # ---------------------------------------------------------------------------
 # Benchmark environment definitions
 # ---------------------------------------------------------------------------
@@ -346,21 +348,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    import certiq_net
-    certiq_net_root = Path(certiq_net.__file__).resolve().parent.parent
-
     if args.qgym_root:
         qgym_root = Path(args.qgym_root).resolve()
     else:
-        qgym_root = certiq_net_root / "extern" / "QGym"
+        qgym_root = resolve_qgym_root()
 
-    if not qgym_root.exists():
-        print(f"QGym root not found: {qgym_root}", file=sys.stderr)
+    if not (qgym_root / "RL" / "PPO" / "trainer.py").exists():
+        print(f"QGym root not found or invalid: {qgym_root}", file=sys.stderr)
         sys.exit(1)
 
     if args.model_config:
         model_config_path = Path(args.model_config).resolve()
     else:
+        import certiq_net
+        certiq_net_root = Path(certiq_net.__file__).resolve().parent.parent
         model_config_path = certiq_net_root / "configs" / "model" / "certiq_index.yaml"
 
     output_dir = Path(args.output_dir)

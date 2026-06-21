@@ -45,8 +45,7 @@ import torch
 import yaml
 from torch import nn
 
-import certiq_net
-
+from certiq_net.studies.qgym_eval._qgym_paths import ensure_qgym_on_path, project_root
 from certiq_net.studies.qgym_eval.train.certiq_sb3_policy import CertiQSB3Policy
 from stable_baselines3.common.env_util import DummyVecEnv, SubprocVecEnv
 
@@ -57,10 +56,9 @@ from certiq_net.studies.qgym_eval.train.qgym_import import (
     parallel_eval,
 )
 
-_project_root = Path(certiq_net.__file__).resolve().parents[2]
-_QGYM_ROOT = _project_root / "extern" / "QGym"
+_QGYM_ROOT = ensure_qgym_on_path()
 _RL_ROOT = _QGYM_ROOT / "RL"
-_OUR_CONFIG_ROOT = _project_root / "src" / "certiq_net" / "studies" / "qgym_eval" / "configs"
+_OUR_CONFIG_ROOT = project_root() / "src" / "certiq_net" / "studies" / "qgym_eval" / "configs"
 
 
 def _load_yaml(path: Path) -> dict:
