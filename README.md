@@ -2,7 +2,7 @@
 
 Learned certified dispatch for queueing systems, powered by [QGym](https://github.com/namkoong-lab/QGym).
 
-**CertiQ-Net** introduces a **learned marginal-cost index policy** with a **closed-form certificate guarantee** for queueing network control. The policy is a Set Transformer that maps per-queue state (queue length, service rate) to dispatch probabilities, with a certificate that the expected delay cost stays within a provable budget.
+**CertiQ-Net** introduces a **learned marginal-cost index policy** with a **closed-form certificate guarantee** for queueing network control. The policy is a Set Transformer that maps per-queue state (queue length, service rate) to dispatch probabilities, with an analytic delay geometry used for certification.
 
 Training and evaluation use QGym's **identical RL/PPO pipeline** (`CustomPPOTrainer` + `CustomRolloutBuffer` + `parallel_eval`) — the CertiQ model drops in as a policy class, same as `Vanilla` or `WC` baselines, ensuring fair comparison.
 
@@ -178,7 +178,7 @@ model:
   num_inducing_points: 4     # Induced attention points (0 = full self-attention)
   dropout: 0.0
   C: 20.0                    # Certificate slack budget constant
-  cost_fn: qmd               # Cost function: "sed", "qmd", or "learned"
+  cost_fn: qmd               # Cost function: "sed" or "qmd"
   constraint_mode: lagrangian  # "lagrangian", "projection", or "unconstrained"
 ```
 
@@ -196,7 +196,6 @@ The internal cost used by the certificate:
 
 - **`sed`**: Shortest Expected Delay — `(Q_i + 1) / μ_i`
 - **`qmd`**: Quadratic Drift — `(2·Q_i + 1) / μ_i`
-- **`learned`**: MLP that learns cost from `(Q_i, μ_i, ξ_i)`
 
 ## Project Structure
 

@@ -1,21 +1,4 @@
-"""CustomPPOTrainer subclass that adds the CertiQ Lagrangian constraint loss.
-
-This trainer patches two divergence modes documented in
-``docs/imp/root_cause_analysis.md``:
-
-  * RC1 — value-loss explosion from a critic target / value-head scale
-    mismatch.  The rollout buffer now keeps returns in RAW scale (patch
-    0021) and the value head predicts raw returns; this trainer mirrors
-    patch 0022 with a residual-clipped Huber value loss so a transient
-    queue spike cannot inject an O(1000) gradient through the shared
-    encoder.
-  * RC4 — a degenerate Lagrangian dual variable.  The original update
-    ``nu += lr_nu * excess / 1000`` used a hard-coded magic constant and
-    ratcheted ``nu`` up forever against a structurally-unsatisfiable
-    constraint once the policy froze.  Here the violation is normalised by
-    an EMA running std, ``nu`` is capped, and the penalty is skipped when
-    the policy is frozen (``mean|ratio-1|`` tiny).
-"""
+"""CustomPPOTrainer subclass that adds the CertiQ Lagrangian constraint loss."""
 
 from __future__ import annotations
 
@@ -23,34 +6,19 @@ import time
 from typing import Any
 
 import torch as th
-import torch.nn as nn
-import torch.nn.functional as F
 
 from certiq_net.studies.qgym_eval.train.qgym_import import CustomPPOTrainer
 
-# Upper bound on the Lagrangian dual variable.  Prevents ``nu`` from growing
-# without limit when the constraint is structurally unsatisfiable (queues
-# growing faster than the budget envelope can absorb).
-NU_MAX = 10.0
-# Maximum per-iteration change in ``nu``.  Caps the ratchet speed so one bad
-# rollout cannot blow the penalty up.
-NU_DELTA_MAX = 0.5
-# A policy is considered "frozen" when the mean absolute deviation of the
-# importance-sampling ratio from 1 drops below this.  In that regime the
-# surrogate gradient is ~0, so the Lagrangian penalty cannot move the policy
-# — pushing ``nu`` up would only build up a useless penalty for later.
-FROZEN_RATIO_EPS = 1e-3
-# Residual clip + Huber beta for the value loss (mirrors patch 0022).
-VALUE_RESIDUAL_CLIP = 10.0
-# Lagrangian cost scale: violations are in raw-cost units (~O(1000)), so we
-# divide by LAGR_SCALE to bring the penalty to O(1) before applying nu.
+# Scaling factor to balance Lagrangian constraint loss against the
+# normalized policy-gradient loss.  The raw cost values from the
+# environment are O(1000) larger than the normalized advantages, so
+# the Lagrangian penalty must be divided by this factor to prevent
+# the constraint gradient from dominating and destroying the policy.
 LAGR_SCALE = 1000.0
-# The constraint penalty may never exceed this fraction of the surrogate
-# policy-loss magnitude.  The cloud run showed lag_loss=575 vs pg_loss=0.038
-# (15,000x) which made the constraint dominate the reward signal and drove
-# the policy to a degenerate queue-exploding solution.  0.5 keeps the
-# constraint a minority contributor to the policy gradient so the reward
-# signal always leads; the constraint trims rather than dictates.
+NU_MAX = 10.0
+NU_DELTA_MAX = 0.5
+FROZEN_RATIO_EPS = 1e-3
+VALUE_RESIDUAL_CLIP = 10.0
 LAG_MAX_FRAC = 0.5
 
 
@@ -70,28 +38,27 @@ class CertiqPPOTrainer(CustomPPOTrainer):
     def _robust_value_loss(
         self, returns: th.Tensor, values_pred: th.Tensor
     ) -> th.Tensor:
-        """Residual-clipped Huber value loss (mirror of patch 0022).
+        """Residual-clipped Huber value loss.
 
-        Clipping the per-element residual bounds the gradient when a rollout
-        contains transient queue spikes; Huber further down-weights large
-        outliers.  This is the mechanism that stops the critic's huge
-        gradient from destabilising the shared policy encoder (RC1/RC2).
+        The residual clip bounds the gradient from large transient queue
+        spikes. The Huber term keeps the loss smooth around zero while
+        down-weighting outliers.
         """
         value_diff = th.clamp(
             values_pred - returns, -VALUE_RESIDUAL_CLIP, VALUE_RESIDUAL_CLIP
         )
-        return F.smooth_l1_loss(value_diff, th.zeros_like(value_diff), beta=1.0)
+        return th.nn.functional.smooth_l1_loss(
+            value_diff, th.zeros_like(value_diff), beta=1.0
+        )
 
     def train(self) -> None:
         """Override ``CustomPPOTrainer.train`` to add the Lagrangian
         constraint penalty ``nu * violation.mean()`` to the policy loss.
 
         The dual variable ``nu`` is updated via gradient ascent on the
-        Lagrangian dual: ``nu = clip(nu + lr_nu * excess_norm, 0, NU_MAX)``
-        where ``excess = E_pi[cost] - budget`` (can be negative when the
-        constraint is satisfied).  The penalty is skipped while the policy
-        is frozen so ``nu`` does not ratchet up against a policy that
-        cannot move.
+        Lagrangian dual: ``nu = max(0, nu + lr_nu * excess)`` where
+        ``excess = E_pi[cost] - budget`` (can be negative when constraint
+        is satisfied).
         """
         policy = self.policy
         if not hasattr(policy, "compute_cost_and_budget"):
@@ -118,7 +85,7 @@ class CertiqPPOTrainer(CustomPPOTrainer):
         pg_losses, value_losses, entropy_losses, lagrangian_losses = [], [], [], []
         clip_fractions = []
         excess_means = []
-        ratio_devs = []  # mean|ratio - 1| per minibatch, for freeze detection
+        ratio_devs = []
         continue_training = True
 
         for epoch in range(self.n_epochs):
@@ -156,16 +123,11 @@ class CertiqPPOTrainer(CustomPPOTrainer):
                 entropy_losses.append(entropy_loss.item())
                 policy_loss = policy_loss + self.ent_coef * entropy_loss
 
-                # Track ratio deviation for freeze detection (RC4).
                 with th.no_grad():
                     ratio_dev = th.mean(th.abs(ratio - 1)).item()
                 ratio_devs.append(ratio_dev)
 
                 # --- Lagrangian constraint ---
-                # Skip the penalty while the policy is frozen: in that regime
-                # the surrogate gradient is ~0, so the constraint gradient
-                # cannot move the policy, and pushing nu up would only build
-                # up a useless penalty for later (the original ratchet bug).
                 policy_frozen = ratio_dev < FROZEN_RATIO_EPS
                 if policy_frozen:
                     lag_loss = th.zeros((), device=policy_loss.device)
@@ -177,21 +139,13 @@ class CertiqPPOTrainer(CustomPPOTrainer):
                     excess = a_final - budget  # can be negative
                     violation = excess.clamp(min=0.0)
 
-                    # Penalty: nu * violation, normalised by LAGR_SCALE so the
-                    # raw-cost-scale violation (~O(1000)) becomes O(1).  The
-                    # cloud run showed the penalty MUST stay small relative to
-                    # the surrogate policy gradient, otherwise it dominates the
-                    # reward signal and the policy degenerates.  Cap lag_loss
-                    # at LAG_MAX_FRAC * |policy_loss| so the constraint can
-                    # never overwhelm the reward objective.
-                    lag_loss = (
-                        self._nu_val * violation.mean() / LAGR_SCALE
-                    )
+                    lag_loss = self._nu_val * violation.mean() / LAGR_SCALE
                     with th.no_grad():
                         pg_mag = policy_loss.abs() + 1e-8
                         lag_cap = LAG_MAX_FRAC * pg_mag
                         lag_loss = th.min(lag_loss, lag_cap)
                     excess_means.append(excess.mean().item())
+
                 lagrangian_losses.append(lag_loss.item())
                 policy_loss = policy_loss + lag_loss
 
@@ -225,7 +179,7 @@ class CertiqPPOTrainer(CustomPPOTrainer):
                 # does not accumulate policy-phase gradients into the value phase.
                 self.policy.zero_grad()
 
-            # Value phase — residual-clipped Huber loss (RC1/RC2 fix).
+            # Value phase (unchanged from parent)
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 values = self.policy.evaluate_values(
                     rollout_data.observations
@@ -255,13 +209,7 @@ class CertiqPPOTrainer(CustomPPOTrainer):
             if not continue_training:
                 break
 
-        # --- Dual variable update (RC4 safeguards) ---
-        # nu = clip(nu + lr_nu * excess / LAGR_SCALE, 0, NU_MAX), with the
-        # per-iteration delta capped.  excess is in raw-cost scale (~O(1000)),
-        # so dividing by LAGR_SCALE brings the update to O(1) — matching the
-        # penalty's LAGR_SCALE divisor keeps the dual ascent consistent with
-        # the primal descent.  The per-iter cap and NU_MAX bound prevent the
-        # ratchet from running away on a structurally-unsatisfiable constraint.
+        # --- Dual variable update ---
         if excess_means:
             avg_excess = th.tensor(excess_means).mean().item()
             nu_delta = self.lr_nu * avg_excess / LAGR_SCALE
@@ -284,10 +232,10 @@ class CertiqPPOTrainer(CustomPPOTrainer):
         self.logger.record(
             "train/clip_fraction", th.tensor(clip_fractions).mean().item()
         )
+        self.logger.record("train/ratio_dev", th.tensor(ratio_devs).mean().item())
         self.logger.record(
             "train/lagrangian_loss",
             th.tensor(lagrangian_losses).mean().item(),
         )
         self.logger.record("train/entropy_loss", th.tensor(entropy_losses).mean().item())
         self.logger.record("train/nu", self._nu_val)
-        self.logger.record("train/ratio_dev", th.tensor(ratio_devs).mean().item())

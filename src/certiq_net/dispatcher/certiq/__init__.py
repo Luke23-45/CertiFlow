@@ -1,6 +1,5 @@
-﻿"""CertiQ index architecture â€” model, interaction, geometry, cost learner."""
+"""CertiQ index architecture - model, interaction, and geometry."""
 
-from certiq_net.dispatcher.certiq.cost_learner import CostLearner
 from certiq_net.dispatcher.certiq.geometry import CertifiedGeometry
 from certiq_net.dispatcher.certiq.index_model import CertiQIndexModel, MarginalIndexHead
 from certiq_net.dispatcher.certiq.interaction import (
@@ -13,6 +12,5 @@ __all__ = [
     "DispatchInteractionEncoder",
     "MarginalIndexHead",
     "CertifiedGeometry",
-    "CostLearner",
     "index_token_features",
 ]

@@ -1,9 +1,8 @@
-﻿"""Dispatcher infrastructure â€” heuristics, types, and the CertiQ index architecture."""
+"""Dispatcher infrastructure - heuristics, types, and the CertiQ index architecture."""
 
 from certiq_net.dispatcher.certiq import (
     CertifiedGeometry,
     CertiQIndexModel,
-    CostLearner,
     DispatchInteractionEncoder,
     MarginalIndexHead,
     index_token_features,
@@ -28,7 +27,6 @@ __all__ = [
     "DispatchInteractionEncoder",
     "MarginalIndexHead",
     "CertifiedGeometry",
-    "CostLearner",
     "index_token_features",
     "delay_arrival_coordinate",
     "delay_envelope",

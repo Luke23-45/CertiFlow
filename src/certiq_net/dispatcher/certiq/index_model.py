@@ -9,13 +9,14 @@ from torch import Tensor
 from certiq_net.dispatcher.certiq.certificate import (
     DifferentiableKLProjection,
 )
-from certiq_net.dispatcher.certiq.cost_learner import CostLearner
 from certiq_net.dispatcher.certiq.interaction import (
     DispatchInteractionEncoder,
     index_token_features,
 )
 from certiq_net.dispatcher.delay_geometry import quadratic_drift_index, sed_index
 from certiq_net.dispatcher.types import DispatcherDiagnostics, DispatcherForward
+
+ALLOWED_COST_FNS = {"sed", "qmd"}
 
 
 def expand_mu(Q: Tensor, mu: Tensor) -> Tensor:
@@ -104,27 +105,27 @@ class CertiQIndexModel(nn.Module):
         tau: float = 1.0,
         exploration_temperature: float = 1.5,
         C: float = 2.0,
-        beta: float = 1.0,
-        cost_fn: str = "sed",
+        cost_fn: str = "qmd",
         d_xi: int = 0,
         encoder_layers: int = 2,
         num_heads: int = 4,
         num_inducing_points: int = 4,
         dropout: float = 0.0,
         constraint_mode: str = "lagrangian",
-        cost_learner_hidden_dim: int = 64,
     ) -> None:
         super().__init__()
         self.N = N
         self.tau = tau
         self.exploration_temperature = float(exploration_temperature)
         self.C = C
-        self.beta = beta
         self.cost_fn = cost_fn
         self.d_xi = int(d_xi)
         self.constraint_mode = constraint_mode
-        if cost_fn == "learned":
-            self.cost_learner = CostLearner(N, hidden_dim=cost_learner_hidden_dim, d_xi=self.d_xi)
+        if self.cost_fn not in ALLOWED_COST_FNS:
+            raise ValueError(
+                f"Unknown cost_fn: {self.cost_fn}. "
+                f"Supported cost functions: {sorted(ALLOWED_COST_FNS)}"
+            )
         self.index_head = MarginalIndexHead(
             N,
             hidden_dim=hidden_dim,
@@ -153,8 +154,6 @@ class CertiQIndexModel(nn.Module):
             cost = sed_index(Q, mu_b)
         elif self.cost_fn == "qmd":
             cost = quadratic_drift_index(Q, mu_b)
-        elif self.cost_fn == "learned":
-            cost = self.cost_learner(Q, mu_b, xi)
         else:
             raise ValueError(f"Unknown cost_fn: {self.cost_fn}")
         cost_min = cost.min(dim=-1).values

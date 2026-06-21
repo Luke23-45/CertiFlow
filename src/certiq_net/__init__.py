@@ -1,9 +1,8 @@
-"""CertiQ-Net — learned certified dispatch for queueing systems."""
+"""CertiQ-Net - learned certified dispatch for queueing systems."""
 
 from certiq_net.dispatcher import (
     CertifiedGeometry,
     CertiQIndexModel,
-    CostLearner,
     DispatcherDiagnostics,
     DispatcherForward,
     DispatchInteractionEncoder,
@@ -20,7 +19,6 @@ from certiq_net.dispatcher import (
 __all__ = [
     "CertiQIndexModel",
     "CertifiedGeometry",
-    "CostLearner",
     "DispatcherDiagnostics",
     "DispatcherForward",
     "DispatchInteractionEncoder",
